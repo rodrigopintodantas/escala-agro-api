@@ -229,9 +229,20 @@ function afastamentoEhFerias(af) {
   return tipoAfastamentoNormalizado(af) === 'ferias';
 }
 
-function afastamentoEhAtestadoOuAbono(af) {
-  const tipo = tipoAfastamentoNormalizado(af);
-  return tipo === 'atestado' || tipo === 'abono';
+function afastamentoEhAtestado(af) {
+  return tipoAfastamentoNormalizado(af) === 'atestado';
+}
+
+function afastamentoEhAbono(af) {
+  return tipoAfastamentoNormalizado(af) === 'abono';
+}
+
+/** Texto exibido no plantão quando o preferencial do dia está só de atestado (ordem do rodízio não muda). */
+function textoGestaoAtestadoMedico(afastamentosPreferencial) {
+  const af = (afastamentosPreferencial || []).find((a) => afastamentoEhAtestado(a));
+  const rawNome = af?.usuario ? af.usuario.nome || af.usuario.login : '';
+  const nome = String(rawNome || '').trim() || 'Veterinário';
+  return `Gestão - Atestado médico ${nome}`;
 }
 
 function adicionarDiasIso(dataIso, dias) {
@@ -296,19 +307,19 @@ function usuarioIndisponivelParaPlantaoNoDia(
 }
 
 /**
- * Mantém comportamento de adiar no ciclo para férias, atestado e abono:
- * - adiar no ciclo durante cobertura;
- * Férias/Atestado/Abono ficam explícitos por tipo para permitir evoluções independentes.
+ * Adiar no ciclo durante cobertura: férias e abono (e tipos com regra explícita no BD).
+ * Atestado médico não altera a ordem do rodízio.
  */
 function afastamentoDeveAdiarNoCiclo(af) {
-  if (afastamentoEhFerias(af) || afastamentoEhAtestadoOuAbono(af)) return true;
+  if (afastamentoEhAtestado(af)) return false;
+  if (afastamentoEhFerias(af) || afastamentoEhAbono(af)) return true;
   return (af?.tipo?.regraOrdem || REGRA_ORDEM.NAO_ALTERA) === REGRA_ORDEM.ADIAR_NO_CICLO;
 }
 
 /**
  * Mapeia, para cada data de plantão, os usuários com retorno obrigatório:
  * - Férias: primeiro plantão após ter trabalhado ao menos 1 dia útil pós-fim;
- * - Atestado/Abono: primeiro plantão após o fim.
+ * - Abono: primeiro plantão após o fim (atestado não entra — não força retorno no ciclo).
  */
 function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
   const mapa = new Map();
@@ -318,8 +329,8 @@ function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
   const datasPlantoes = plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia));
   for (const af of afastamentos) {
     const ehFerias = afastamentoEhFerias(af);
-    const ehAtestadoOuAbono = afastamentoEhAtestadoOuAbono(af);
-    if (!ehFerias && !ehAtestadoOuAbono) continue;
+    const ehAbono = afastamentoEhAbono(af);
+    if (!ehFerias && !ehAbono) continue;
     const usuarioId = Number(af.usuarioId);
     if (!Number.isFinite(usuarioId)) continue;
     const fimIso = dataReferenciaParaStr(af.dataFim);
@@ -642,7 +653,10 @@ async function recalcularEscalaInterno(
       dataInicio: { [Op.lte]: dataFimStr },
       dataFim: { [Op.gte]: dataInicioStr },
     },
-    include: [{ model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] }],
+    include: [
+      { model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] },
+      { model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] },
+    ],
     transaction,
   });
   const afastamentosPorUsuario = montarAfastamentosPorUsuario(afastamentos);
@@ -668,6 +682,8 @@ async function recalcularEscalaInterno(
   for (const plantao of plantoes) {
     const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
     if (!ordemAtual.length) break;
+
+    let observacaoPlantao = null;
 
     const idxPreferencial = idxOrdem % ordemAtual.length;
     const usuarioPreferencial = ordemAtual[idxPreferencial];
@@ -720,37 +736,52 @@ async function recalcularEscalaInterno(
         filaRetornosFeriasPendentes.splice(idxFila, 1);
       }
     } else if (preferencialIndisponivel) {
-      let encontrado = null;
-      for (let passo = 1; passo <= ordemAtual.length; passo++) {
-        const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
-        if (!usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, candidato, dataIso, datasNaoUteisParaRetornoFerias)) {
-          encontrado = candidato;
-          break;
-        }
-      }
+      const gestaoAtestado =
+        !preferencialBloqueadoPosFerias &&
+        afastamentosPreferencial.length > 0 &&
+        afastamentosPreferencial.every((af) => afastamentoEhAtestado(af));
 
-      if (!encontrado) {
-        throw new ApiBaseError(`Não há veterinário disponível para o plantão em ${dataIso}.`);
-      }
-
-      usuarioAlocado = encontrado;
-      const deveAlterarOrdem =
-        afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) || preferencialBloqueadoPosFerias;
-
-      if (deveAlterarOrdem) {
-        ordemAtual = moverUsuarioDepoisDaCobertura(ordemAtual, usuarioPreferencial, usuarioAlocado);
-        ordemGlobal = moverUsuarioDepoisDaCobertura(ordemGlobal, usuarioPreferencial, usuarioAlocado);
-        idxOrdem = (ordemAtual.indexOf(usuarioAlocado) + 1) % ordemAtual.length;
-      } else {
+      if (gestaoAtestado) {
+        usuarioAlocado = usuarioPreferencial;
+        observacaoPlantao = textoGestaoAtestadoMedico(afastamentosPreferencial);
         idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
+      } else {
+        let encontrado = null;
+        for (let passo = 1; passo <= ordemAtual.length; passo++) {
+          const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
+          if (!usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, candidato, dataIso, datasNaoUteisParaRetornoFerias)) {
+            encontrado = candidato;
+            break;
+          }
+        }
+
+        if (!encontrado) {
+          throw new ApiBaseError(`Não há veterinário disponível para o plantão em ${dataIso}.`);
+        }
+
+        usuarioAlocado = encontrado;
+        const deveAlterarOrdem =
+          afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) || preferencialBloqueadoPosFerias;
+
+        if (deveAlterarOrdem) {
+          ordemAtual = moverUsuarioDepoisDaCobertura(ordemAtual, usuarioPreferencial, usuarioAlocado);
+          ordemGlobal = moverUsuarioDepoisDaCobertura(ordemGlobal, usuarioPreferencial, usuarioAlocado);
+          idxOrdem = (ordemAtual.indexOf(usuarioAlocado) + 1) % ordemAtual.length;
+        } else {
+          idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
+        }
       }
     } else {
       idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
     }
 
-    if (Number(plantao.usuarioId) !== Number(usuarioAlocado)) {
+    const obsDesejada = observacaoPlantao;
+    const usuarioMudou = Number(plantao.usuarioId) !== Number(usuarioAlocado);
+    const obsMudou = (plantao.observacao || null) !== (obsDesejada || null);
+    if (usuarioMudou || obsMudou) {
       /** Sempre persiste alocação simulada; senão o BD fica defasado e idxOrdem diverge (ex.: desfazer afastamento com persistir a partir da data do afastamento). */
       plantao.usuarioId = Number(usuarioAlocado);
+      plantao.observacao = obsDesejada;
       await plantao.save({ transaction });
       atualizados += 1;
     }
@@ -1002,14 +1033,14 @@ const EscalaService = {
         {
           model: PlantaoModel,
           as: 'plantaoOrigem',
-          attributes: ['id', 'dataReferencia', 'usuarioId'],
+          attributes: ['id', 'dataReferencia', 'usuarioId', 'observacao'],
           required: false,
           include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
         },
         {
           model: PlantaoModel,
           as: 'plantaoDestino',
-          attributes: ['id', 'dataReferencia', 'usuarioId'],
+          attributes: ['id', 'dataReferencia', 'usuarioId', 'observacao'],
           required: false,
           include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
         },
@@ -1062,6 +1093,8 @@ const EscalaService = {
       const uDestinatario = pDestino.usuarioId;
       pOrigem.usuarioId = uDestinatario;
       pDestino.usuarioId = uSolicitante;
+      pOrigem.observacao = null;
+      pDestino.observacao = null;
       await pOrigem.save({ transaction: t });
       await pDestino.save({ transaction: t });
 
