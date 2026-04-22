@@ -225,26 +225,90 @@ function tipoAfastamentoNormalizado(af) {
   return normalizarTextoSemAcento(af?.tipo?.tipo);
 }
 
-function afastamentoEhFeriasOuAtestadoOuAbono(af) {
+function afastamentoEhFerias(af) {
+  return tipoAfastamentoNormalizado(af) === 'ferias';
+}
+
+function afastamentoEhAtestadoOuAbono(af) {
   const tipo = tipoAfastamentoNormalizado(af);
-  return tipo === 'ferias' || tipo === 'atestado' || tipo === 'abono';
+  return tipo === 'atestado' || tipo === 'abono';
+}
+
+function adicionarDiasIso(dataIso, dias) {
+  const d = new Date(`${dataIso}T12:00:00`);
+  d.setDate(d.getDate() + dias);
+  return dataReferenciaParaStr(d);
+}
+
+function diaUtilDataIso(dataIso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dataIso || ''))) return false;
+  const d = new Date(`${dataIso}T12:00:00`);
+  const dow = d.getDay();
+  return dow >= 1 && dow <= 5;
 }
 
 /**
- * Mantém comportamento de férias também para atestado e abono:
+ * Verifica se existe pelo menos um dia útil em [inicioInclusivo, fimExclusivo).
+ */
+function existeDiaUtilNoIntervalo(inicioInclusivoIso, fimExclusivoIso, datasNaoUteisIsoSet = new Set()) {
+  if (!inicioInclusivoIso || !fimExclusivoIso) return false;
+  let cur = new Date(`${inicioInclusivoIso}T12:00:00`);
+  const end = new Date(`${fimExclusivoIso}T12:00:00`);
+  while (cur < end) {
+    const iso = dataReferenciaParaStr(cur);
+    if (diaUtilDataIso(iso) && !datasNaoUteisIsoSet.has(iso)) return true;
+    cur.setDate(cur.getDate() + 1);
+  }
+  return false;
+}
+
+/**
+ * Férias: antes de completar ao menos 1 dia útil pós-fim, o usuário ainda não pode ser escalado.
+ * Ex.: fim na sexta -> sábado/domingo continuam indisponíveis; libera após passar por 1 dia útil.
+ */
+function usuarioBloqueadoPosFeriasNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet = new Set()) {
+  const lista = afastamentosPorUsuario.get(Number(usuarioId)) || [];
+  for (const af of lista) {
+    if (!afastamentoEhFerias(af)) continue;
+    const fimIso = dataReferenciaParaStr(af.dataFim);
+    if (!fimIso || !(dataIso > fimIso)) continue;
+    const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
+    /**
+     * Regra: só libera após existir ao menos 1 dia útil *antes* deste plantão.
+     * Não considerar o próprio `dataIso` (ex.: plantão extra em segunda/feriado) como
+     * "dia útil já trabalhado", senão o usuário é liberado cedo demais.
+     */
+    const jaPassouDiaUtil = existeDiaUtilNoIntervalo(primeiroDiaPosFim, dataIso, datasNaoUteisIsoSet);
+    if (!jaPassouDiaUtil) return true;
+  }
+  return false;
+}
+
+function usuarioIndisponivelParaPlantaoNoDia(
+  afastamentosPorUsuario,
+  usuarioId,
+  dataIso,
+  datasNaoUteisIsoSet = new Set(),
+) {
+  if (afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioId, dataIso).length > 0) return true;
+  if (usuarioBloqueadoPosFeriasNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet)) return true;
+  return false;
+}
+
+/**
+ * Mantém comportamento de adiar no ciclo para férias, atestado e abono:
  * - adiar no ciclo durante cobertura;
- * - retorno obrigatório no primeiro plantão pós-fim.
- * Isso evita dependência exclusiva de `regraOrdem` e facilita evolução futura:
- * mudanças em férias não precisam impactar atestado/abono.
+ * Férias/Atestado/Abono ficam explícitos por tipo para permitir evoluções independentes.
  */
 function afastamentoDeveAdiarNoCiclo(af) {
-  if (afastamentoEhFeriasOuAtestadoOuAbono(af)) return true;
+  if (afastamentoEhFerias(af) || afastamentoEhAtestadoOuAbono(af)) return true;
   return (af?.tipo?.regraOrdem || REGRA_ORDEM.NAO_ALTERA) === REGRA_ORDEM.ADIAR_NO_CICLO;
 }
 
 /**
- * Mapeia, para cada data de plantão, os usuários que devem retornar obrigatoriamente
- * no primeiro plantão após o fim do afastamento (férias/atestado/abono).
+ * Mapeia, para cada data de plantão, os usuários com retorno obrigatório:
+ * - Férias: primeiro plantão após ter trabalhado ao menos 1 dia útil pós-fim;
+ * - Atestado/Abono: primeiro plantão após o fim.
  */
 function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
   const mapa = new Map();
@@ -253,12 +317,22 @@ function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
   }
   const datasPlantoes = plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia));
   for (const af of afastamentos) {
-    if (!afastamentoEhFeriasOuAtestadoOuAbono(af)) continue;
+    const ehFerias = afastamentoEhFerias(af);
+    const ehAtestadoOuAbono = afastamentoEhAtestadoOuAbono(af);
+    if (!ehFerias && !ehAtestadoOuAbono) continue;
     const usuarioId = Number(af.usuarioId);
     if (!Number.isFinite(usuarioId)) continue;
     const fimIso = dataReferenciaParaStr(af.dataFim);
     if (!fimIso) continue;
-    const primeiraDataPosRetorno = datasPlantoes.find((ds) => ds > fimIso);
+    let primeiraDataPosRetorno = null;
+    if (ehFerias) {
+      const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
+      primeiraDataPosRetorno = datasPlantoes.find(
+        (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds),
+      );
+    } else {
+      primeiraDataPosRetorno = datasPlantoes.find((ds) => ds > fimIso);
+    }
     if (!primeiraDataPosRetorno) continue;
     const atual = mapa.get(primeiraDataPosRetorno) || [];
     if (!atual.includes(usuarioId)) {
@@ -269,7 +343,14 @@ function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
   return mapa;
 }
 
-function escolherRetornoFeriasDoDia(retornosHoje, ordemAtual, idxPreferencial, afastamentosPorUsuario, dataIso) {
+function escolherRetornoFeriasDoDia(
+  retornosHoje,
+  ordemAtual,
+  idxPreferencial,
+  afastamentosPorUsuario,
+  dataIso,
+  datasNaoUteisIsoSet = new Set(),
+) {
   if (!Array.isArray(retornosHoje) || retornosHoje.length === 0 || ordemAtual.length === 0) {
     return null;
   }
@@ -279,7 +360,7 @@ function escolherRetornoFeriasDoDia(retornosHoje, ordemAtual, idxPreferencial, a
     const uid = Number(uidRaw);
     const idx = ordemAtual.indexOf(uid);
     if (idx < 0) continue;
-    if (afastamentosAtivosNoDia(afastamentosPorUsuario, uid, dataIso).length > 0) continue;
+    if (usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet)) continue;
     const distancia = (idx - idxPreferencial + ordemAtual.length) % ordemAtual.length;
     if (distancia < menorDistancia) {
       menorDistancia = distancia;
@@ -566,6 +647,18 @@ async function recalcularEscalaInterno(
   });
   const afastamentosPorUsuario = montarAfastamentosPorUsuario(afastamentos);
   const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes);
+  /**
+   * Em escalas de fim de semana, plantões adicionais em dias úteis representam feriado/ponto facultativo
+   * e não devem contar como "dia útil trabalhado" para liberar retorno de férias.
+   */
+  const datasNaoUteisParaRetornoFerias =
+    String(escala.periodicidade || '').toLowerCase() === 'fim_de_semana'
+      ? new Set(
+          plantoes
+            .map((p) => dataReferenciaParaStr(p.dataReferencia))
+            .filter((ds) => !!ds && !ehFimDeSemanaDataReferencia(ds)),
+        )
+      : new Set();
   /** Retornos de férias já vencidos e ainda não alocados (empates no mesmo dia, indisponibilidade etc.). */
   const filaRetornosFeriasPendentes = [];
 
@@ -579,6 +672,18 @@ async function recalcularEscalaInterno(
     const idxPreferencial = idxOrdem % ordemAtual.length;
     const usuarioPreferencial = ordemAtual[idxPreferencial];
     const afastamentosPreferencial = afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioPreferencial, dataIso);
+    const preferencialBloqueadoPosFerias = usuarioBloqueadoPosFeriasNoDia(
+      afastamentosPorUsuario,
+      usuarioPreferencial,
+      dataIso,
+      datasNaoUteisParaRetornoFerias,
+    );
+    const preferencialIndisponivel = usuarioIndisponivelParaPlantaoNoDia(
+      afastamentosPorUsuario,
+      usuarioPreferencial,
+      dataIso,
+      datasNaoUteisParaRetornoFerias,
+    );
 
     let usuarioAlocado = usuarioPreferencial;
     const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
@@ -595,6 +700,7 @@ async function recalcularEscalaInterno(
       idxPreferencial,
       afastamentosPorUsuario,
       dataIso,
+      datasNaoUteisParaRetornoFerias,
     );
 
     if (retornoFeriasForcado != null) {
@@ -613,12 +719,11 @@ async function recalcularEscalaInterno(
       if (idxFila >= 0) {
         filaRetornosFeriasPendentes.splice(idxFila, 1);
       }
-    } else if (afastamentosPreferencial.length > 0) {
+    } else if (preferencialIndisponivel) {
       let encontrado = null;
       for (let passo = 1; passo <= ordemAtual.length; passo++) {
         const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
-        const afCandidato = afastamentosAtivosNoDia(afastamentosPorUsuario, candidato, dataIso);
-        if (afCandidato.length === 0) {
+        if (!usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, candidato, dataIso, datasNaoUteisParaRetornoFerias)) {
           encontrado = candidato;
           break;
         }
@@ -629,7 +734,8 @@ async function recalcularEscalaInterno(
       }
 
       usuarioAlocado = encontrado;
-      const deveAlterarOrdem = afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af));
+      const deveAlterarOrdem =
+        afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) || preferencialBloqueadoPosFerias;
 
       if (deveAlterarOrdem) {
         ordemAtual = moverUsuarioDepoisDaCobertura(ordemAtual, usuarioPreferencial, usuarioAlocado);
