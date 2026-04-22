@@ -1,0 +1,10 @@
+# Dev Container: mesmo diretório de docker-compose.yml → `.` é sempre escala-agro-api (não o monorepo).
+services:
+  api:
+    volumes:
+      - .:/app:cached
+      - api_node_modules:/app/node_modules
+    command: sleep infinity
+
+volumes:
+  api_node_modules:

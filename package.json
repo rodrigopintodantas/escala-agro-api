@@ -1,0 +1,38 @@
+{
+  "name": "escala-agro-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start:with-migrate": "npm run db:migrate && npm run start",
+    "start": "nodemon ./bin/www",
+    "dev": "nodemon ./bin/www",
+    "db:migrate": "sequelize-cli db:migrate",
+    "db:migrate:undo": "sequelize-cli db:migrate:undo",
+    "db:migrate:undo:all": "sequelize-cli db:migrate:undo:all",
+    "db:seed": "sequelize-cli db:seed:all",
+    "db:create": "sequelize-cli db:create",
+    "db:drop": "sequelize-cli db:drop",
+    "test": "NODE_ENV=test jest"
+  },
+  "dependencies": {
+    "body-parser": "2.1.0",
+    "cookie-parser": "~1.4.4",
+    "cors": "^2.8.5",
+    "debug": "4.4.0",
+    "dotenv": "^16.6.1",
+    "express": "5.0.1",
+    "express-async-handler": "^1.2.0",
+    "express-validator": "^7.2.1",
+    "http-errors": "^2.0.0",
+    "morgan": "1.10.0",
+    "pg": "^8.16.3",
+    "pg-hstore": "^2.3.4",
+    "sequelize": "^6.37.7"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.9",
+    "sequelize-cli": "^6.6.3",
+    "supertest": "^6.3.4"
+  }
+}

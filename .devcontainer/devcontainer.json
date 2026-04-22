@@ -1,0 +1,15 @@
+{
+  "name": "Escala Agro API",
+  "dockerComposeFile": ["../docker-compose.yml", "../docker-compose.devcontainer.yml"],
+  "service": "api",
+  "workspaceFolder": "/app",
+  "forwardPorts": [3000, 5432],
+  "postCreateCommand": "npm install && npx sequelize-cli db:migrate",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

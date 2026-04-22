@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: escala
+      POSTGRES_PASSWORD: escala
+      POSTGRES_DB: escala_agro
+    ports:
+      - '5432:5432'
+    volumes:
+      - escala_agro_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U escala -d escala_agro']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: stage
+      DOCKER_CONTAINER: 'true'
+      PORT: '3000'
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_USER: escala
+      DB_PASSWORD: escala
+      DB_DATABASE: escala_agro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  escala_agro_pgdata:
