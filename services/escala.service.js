@@ -21,6 +21,14 @@ const REGRA_ORDEM = {
   NAO_ALTERA: 'nao_altera',
   ADIAR_NO_CICLO: 'adiar_no_ciclo',
 };
+const PAPEIS_VETERINARIO = ['Veterinario', 'Veterinário'];
+
+async function obterPapelVeterinario(transaction) {
+  return PapelModel.findOne({
+    where: { nome: { [Op.in]: PAPEIS_VETERINARIO } },
+    transaction,
+  });
+}
 
 function dataReferenciaParaStr(v) {
   if (v == null) return '';
@@ -457,7 +465,7 @@ async function atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemUsuarioIds, 
 
 /** Ordem global de todos os veterinários ativos (tabela `ordem_servidor`), com fallback para novos sem linha. */
 async function obterOrdemGlobalUsuarioIds(transaction) {
-  const papelVet = await PapelModel.findOne({ where: { nome: 'Veterinario' } });
+  const papelVet = await obterPapelVeterinario(transaction);
   if (!papelVet) return [];
 
   const vets = await UsuarioModel.findAll({
@@ -1263,7 +1271,7 @@ const EscalaService = {
   },
 
   listarVeterinarios: async () => {
-    const papelVet = await PapelModel.findOne({ where: { nome: 'Veterinario' } });
+    const papelVet = await obterPapelVeterinario();
     if (!papelVet) return [];
 
     const vets = await UsuarioModel.findAll({

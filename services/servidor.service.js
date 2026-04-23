@@ -12,7 +12,7 @@ const ServidorService = {
       SELECT u.id, u.nome, u.login, COALESCE(COUNT(p.id), 0)::int AS saldo
       FROM usuario u
       INNER JOIN usuario_papel up ON up.usuario_id = u.id
-      INNER JOIN papel pa ON pa.id = up.papel_id AND pa.nome = 'Veterinario'
+      INNER JOIN papel pa ON pa.id = up.papel_id AND pa.nome IN ('Veterinario', 'Veterinário')
       LEFT JOIN plantao p ON p.usuario_id = u.id AND p.status IN ('previsto', 'confirmado')
       WHERE u.ativo = true
       GROUP BY u.id, u.nome, u.login

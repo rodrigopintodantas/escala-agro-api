@@ -6,7 +6,7 @@ module.exports = {
     const now = new Date();
 
     const papeisRows = await queryInterface.sequelize.query(
-      `SELECT id FROM papel WHERE nome = 'Veterinario' LIMIT 1`,
+      `SELECT id FROM papel WHERE nome = 'Veterinário' LIMIT 1`,
       { type: Sequelize.QueryTypes.SELECT },
     );
     const papelVet = papeisRows[0];

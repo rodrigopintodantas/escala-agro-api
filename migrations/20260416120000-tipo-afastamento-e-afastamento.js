@@ -132,7 +132,7 @@ module.exports = {
           FROM usuario u
           JOIN usuario_papel up ON up.usuario_id = u.id
           JOIN papel p ON p.id = up.papel_id
-         WHERE p.nome = 'Veterinario'
+         WHERE p.nome IN ('Veterinario', 'Veterinário')
            AND u.ativo = true
            AND NOT EXISTS (
              SELECT 1
