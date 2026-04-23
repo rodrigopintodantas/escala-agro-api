@@ -754,12 +754,27 @@ async function recalcularEscalaInterno(
         idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
       } else {
         let encontrado = null;
+        let encontradoComGestaoAtestado = false;
+        let afastamentosEncontrado = [];
         for (let passo = 1; passo <= ordemAtual.length; passo++) {
           const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
-          if (!usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, candidato, dataIso, datasNaoUteisParaRetornoPosAfastamento)) {
-            encontrado = candidato;
-            break;
-          }
+          const afastamentosCandidato = afastamentosAtivosNoDia(afastamentosPorUsuario, candidato, dataIso);
+          const candidatoBloqueadoPosFeriasOuAbono = usuarioBloqueadoPosFeriasOuAbonoNoDia(
+            afastamentosPorUsuario,
+            candidato,
+            dataIso,
+            datasNaoUteisParaRetornoPosAfastamento,
+          );
+          const candidatoSomenteAtestado =
+            !candidatoBloqueadoPosFeriasOuAbono &&
+            afastamentosCandidato.length > 0 &&
+            afastamentosCandidato.every((af) => afastamentoEhAtestado(af));
+          const candidatoIndisponivelReal = candidatoBloqueadoPosFeriasOuAbono || (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
+          if (candidatoIndisponivelReal) continue;
+          encontrado = candidato;
+          encontradoComGestaoAtestado = candidatoSomenteAtestado;
+          afastamentosEncontrado = afastamentosCandidato;
+          break;
         }
 
         if (!encontrado) {
@@ -767,6 +782,9 @@ async function recalcularEscalaInterno(
         }
 
         usuarioAlocado = encontrado;
+        if (encontradoComGestaoAtestado) {
+          observacaoPlantao = textoGestaoAtestadoMedico(afastamentosEncontrado);
+        }
         const deveAlterarOrdem =
           afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) || preferencialBloqueadoPosFerias;
 
