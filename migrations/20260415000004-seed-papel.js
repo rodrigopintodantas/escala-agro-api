@@ -15,7 +15,7 @@ module.exports = {
         updatedAt: now,
       },
       {
-        nome: 'Veterinario',
+        nome: 'Veterinário',
         descricao: 'Papel para veterinários do sistema',
         ativo: true,
         dashboard: '/vt',
