@@ -1406,7 +1406,7 @@ const EscalaService = {
           dataFim,
           periodicidade,
           modoOrdemInicial: 'fixa',
-          status: 'rascunho',
+          status: 'ativa',
           criadoPorUsuarioId: criadoPorUsuarioId || null,
         },
         { transaction: t },
