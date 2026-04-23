@@ -274,13 +274,13 @@ function existeDiaUtilNoIntervalo(inicioInclusivoIso, fimExclusivoIso, datasNaoU
 }
 
 /**
- * Férias: antes de completar ao menos 1 dia útil pós-fim, o usuário ainda não pode ser escalado.
+ * Férias/Abono: antes de completar ao menos 1 dia útil pós-fim, o usuário ainda não pode ser escalado.
  * Ex.: fim na sexta -> sábado/domingo continuam indisponíveis; libera após passar por 1 dia útil.
  */
-function usuarioBloqueadoPosFeriasNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet = new Set()) {
+function usuarioBloqueadoPosFeriasOuAbonoNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet = new Set()) {
   const lista = afastamentosPorUsuario.get(Number(usuarioId)) || [];
   for (const af of lista) {
-    if (!afastamentoEhFerias(af)) continue;
+    if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) continue;
     const fimIso = dataReferenciaParaStr(af.dataFim);
     if (!fimIso || !(dataIso > fimIso)) continue;
     const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
@@ -302,7 +302,7 @@ function usuarioIndisponivelParaPlantaoNoDia(
   datasNaoUteisIsoSet = new Set(),
 ) {
   if (afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioId, dataIso).length > 0) return true;
-  if (usuarioBloqueadoPosFeriasNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet)) return true;
+  if (usuarioBloqueadoPosFeriasOuAbonoNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet)) return true;
   return false;
 }
 
@@ -318,10 +318,10 @@ function afastamentoDeveAdiarNoCiclo(af) {
 
 /**
  * Mapeia, para cada data de plantão, os usuários com retorno obrigatório:
- * - Férias: primeiro plantão após ter trabalhado ao menos 1 dia útil pós-fim;
- * - Abono: primeiro plantão após o fim (atestado não entra — não força retorno no ciclo).
+ * - Férias/Abono: primeiro plantão após ter trabalhado ao menos 1 dia útil pós-fim;
+ * - Atestado não entra (não força retorno no ciclo).
  */
-function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
+function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes, datasNaoUteisIsoSet = new Set()) {
   const mapa = new Map();
   if (!Array.isArray(afastamentos) || !Array.isArray(plantoes) || plantoes.length === 0) {
     return mapa;
@@ -335,15 +335,10 @@ function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes) {
     if (!Number.isFinite(usuarioId)) continue;
     const fimIso = dataReferenciaParaStr(af.dataFim);
     if (!fimIso) continue;
-    let primeiraDataPosRetorno = null;
-    if (ehFerias) {
-      const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
-      primeiraDataPosRetorno = datasPlantoes.find(
-        (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds),
-      );
-    } else {
-      primeiraDataPosRetorno = datasPlantoes.find((ds) => ds > fimIso);
-    }
+    const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
+    const primeiraDataPosRetorno = datasPlantoes.find(
+      (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds, datasNaoUteisIsoSet),
+    );
     if (!primeiraDataPosRetorno) continue;
     const atual = mapa.get(primeiraDataPosRetorno) || [];
     if (!atual.includes(usuarioId)) {
@@ -660,12 +655,11 @@ async function recalcularEscalaInterno(
     transaction,
   });
   const afastamentosPorUsuario = montarAfastamentosPorUsuario(afastamentos);
-  const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes);
   /**
    * Em escalas de fim de semana, plantões adicionais em dias úteis representam feriado/ponto facultativo
-   * e não devem contar como "dia útil trabalhado" para liberar retorno de férias.
+   * e não devem contar como "dia útil trabalhado" para liberar retorno pós-férias/abono.
    */
-  const datasNaoUteisParaRetornoFerias =
+  const datasNaoUteisParaRetornoPosAfastamento =
     String(escala.periodicidade || '').toLowerCase() === 'fim_de_semana'
       ? new Set(
           plantoes
@@ -673,6 +667,11 @@ async function recalcularEscalaInterno(
             .filter((ds) => !!ds && !ehFimDeSemanaDataReferencia(ds)),
         )
       : new Set();
+  const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
+    afastamentos,
+    plantoes,
+    datasNaoUteisParaRetornoPosAfastamento,
+  );
   /** Retornos de férias já vencidos e ainda não alocados (empates no mesmo dia, indisponibilidade etc.). */
   const filaRetornosFeriasPendentes = [];
 
@@ -688,17 +687,17 @@ async function recalcularEscalaInterno(
     const idxPreferencial = idxOrdem % ordemAtual.length;
     const usuarioPreferencial = ordemAtual[idxPreferencial];
     const afastamentosPreferencial = afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioPreferencial, dataIso);
-    const preferencialBloqueadoPosFerias = usuarioBloqueadoPosFeriasNoDia(
+    const preferencialBloqueadoPosFerias = usuarioBloqueadoPosFeriasOuAbonoNoDia(
       afastamentosPorUsuario,
       usuarioPreferencial,
       dataIso,
-      datasNaoUteisParaRetornoFerias,
+      datasNaoUteisParaRetornoPosAfastamento,
     );
     const preferencialIndisponivel = usuarioIndisponivelParaPlantaoNoDia(
       afastamentosPorUsuario,
       usuarioPreferencial,
       dataIso,
-      datasNaoUteisParaRetornoFerias,
+      datasNaoUteisParaRetornoPosAfastamento,
     );
 
     let usuarioAlocado = usuarioPreferencial;
@@ -716,7 +715,7 @@ async function recalcularEscalaInterno(
       idxPreferencial,
       afastamentosPorUsuario,
       dataIso,
-      datasNaoUteisParaRetornoFerias,
+      datasNaoUteisParaRetornoPosAfastamento,
     );
 
     if (retornoFeriasForcado != null) {
@@ -749,7 +748,7 @@ async function recalcularEscalaInterno(
         let encontrado = null;
         for (let passo = 1; passo <= ordemAtual.length; passo++) {
           const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
-          if (!usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, candidato, dataIso, datasNaoUteisParaRetornoFerias)) {
+          if (!usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, candidato, dataIso, datasNaoUteisParaRetornoPosAfastamento)) {
             encontrado = candidato;
             break;
           }
