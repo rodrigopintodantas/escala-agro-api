@@ -1,14 +1,24 @@
 const ServidorService = require('../services/servidor.service');
 
-const listarSaldoVeterinarios = async (req, res, next) => {
+const listarVeterinarios = async (req, res, next) => {
   try {
-    const lista = await ServidorService.listarSaldoVeterinarios();
+    const lista = await ServidorService.listarVeterinarios();
     res.status(200).json(lista);
   } catch (err) {
     next(err);
   }
 };
 
+const excluirVeterinario = async (req, res, next) => {
+  try {
+    const resultado = await ServidorService.excluirVeterinario(req.params.id);
+    res.status(200).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
-  listarSaldoVeterinarios,
+  listarVeterinarios,
+  excluirVeterinario,
 };

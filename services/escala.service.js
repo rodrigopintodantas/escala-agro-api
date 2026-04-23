@@ -1746,6 +1746,118 @@ const EscalaService = {
     });
   },
 
+  removerUsuarioDasEscalasAtivas: async (usuarioIdRaw, transaction) => {
+    const usuarioId = Number(usuarioIdRaw);
+    if (!Number.isFinite(usuarioId) || usuarioId < 1) {
+      throw new ApiBaseError('Usuário inválido para remoção da escala ativa.');
+    }
+
+    const escalasAtivas = await EscalaModel.findAll({
+      where: { status: 'ativa' },
+      attributes: ['id'],
+      transaction,
+    });
+
+    let escalasAfetadas = 0;
+    let plantoesAtualizados = 0;
+    let ordensAlteradas = 0;
+    let ordemGlobalAlterada = false;
+    let permutasCanceladas = 0;
+
+    for (const esc of escalasAtivas) {
+      const escalaId = Number(esc.id);
+      const membrosEscala = await EscalaMembroModel.findAll({
+        where: { escalaId },
+        attributes: ['id', 'usuarioId', 'ordem'],
+        order: [
+          ['ordem', 'ASC'],
+          ['id', 'ASC'],
+        ],
+        transaction,
+      });
+      const idsAtivos = membrosEscala
+        .map((m) => Number(m.usuarioId))
+        .filter((id) => Number.isFinite(id) && id > 0);
+      if (!idsAtivos.includes(usuarioId)) continue;
+      if (idsAtivos.length <= 1) {
+        throw new ApiBaseError('Não é possível excluir o último veterinário de uma escala ativa.');
+      }
+
+      /**
+       * Evita colisão em (escala_id, ordem):
+       * 1) move TODOS os membros da escala para ordens temporárias negativas e únicas;
+       * 2) desativa o veterinário removido;
+       * 3) reaplica ordens positivas para os ativos remanescentes.
+       */
+      for (let i = 0; i < membrosEscala.length; i++) {
+        const usuarioTmp = Number(membrosEscala[i].usuarioId);
+        await EscalaMembroModel.update(
+          { ordem: -(i + 1) },
+          {
+            where: { escalaId, usuarioId: usuarioTmp },
+            transaction,
+          },
+        );
+      }
+
+      await EscalaMembroModel.update(
+        { ativo: false },
+        {
+          where: { escalaId, usuarioId, ativo: true },
+          transaction,
+        },
+      );
+
+      const idsRestantes = idsAtivos.filter((id) => id !== usuarioId).map((id) => Number(id));
+      for (let i = 0; i < idsRestantes.length; i++) {
+        await EscalaMembroModel.update(
+          { ordem: i + 1 },
+          {
+            where: { escalaId, usuarioId: idsRestantes[i], ativo: true },
+            transaction,
+          },
+        );
+      }
+
+      /**
+       * Inativos não podem compartilhar a mesma faixa de ordens usada no recálculo.
+       * Joga cada inativo para uma ordem alta e única por `id`, evitando colisão com
+       * `atualizarOrdemMembrosEscalaSemColisao` (que usa ordens temporárias negativas).
+       */
+      const idsRestantesSet = new Set(idsRestantes);
+      for (const m of membrosEscala) {
+        const uid = Number(m.usuarioId);
+        if (idsRestantesSet.has(uid)) continue;
+        await EscalaMembroModel.update(
+          { ordem: 1000000 + Number(m.id) },
+          {
+            where: { id: Number(m.id), escalaId },
+            transaction,
+          },
+        );
+      }
+
+      const recalc = await recalcularEscalaInterno(escalaId, {
+        transaction,
+        historicoMotivo: 'manual',
+        skipBootstrap: true,
+      });
+      escalasAfetadas += 1;
+      plantoesAtualizados += recalc.atualizados;
+      if (recalc.ordemMudou) ordensAlteradas += 1;
+      if (recalc.ordemGlobalMudou) ordemGlobalAlterada = true;
+      permutasCanceladas += await cancelarPermutasPendentesEscala(escalaId, transaction);
+    }
+
+    return {
+      escalasAfetadas,
+      plantoesAtualizados,
+      ordensAlteradas,
+      ordemGlobalAlterada,
+      permutasCanceladas,
+    };
+  },
+
   excluir: async (id) => {
     const escala = await EscalaModel.findByPk(id);
     if (!escala) return false;
