@@ -6,6 +6,7 @@ const EscalaService = require('./escala.service');
 const { UsuarioModel, UsuarioPapelModel, PapelModel, OrdemServidorModel } = models;
 
 const PAPEIS_VETERINARIO = ['Veterinario', 'Veterinário'];
+const ESCOPO_ORDEM_VETERINARIO = 'veterinario';
 
 const ServidorService = {
   listarVeterinarios: async () => {
@@ -47,20 +48,22 @@ const ServidorService = {
 
       const recalcEscalas = await EscalaService.removerUsuarioDasEscalasAtivas(usuarioId, t);
 
-      await OrdemServidorModel.destroy({ where: { usuarioId }, transaction: t });
+      await OrdemServidorModel.destroy({ where: { usuarioId, escopo: ESCOPO_ORDEM_VETERINARIO }, transaction: t });
       const ordemRestante = await OrdemServidorModel.findAll({
+        where: { escopo: ESCOPO_ORDEM_VETERINARIO },
         order: [['ordem', 'ASC']],
         transaction: t,
       });
       const idsRestantes = ordemRestante
         .map((r) => Number(r.usuarioId))
         .filter((id) => Number.isFinite(id) && id > 0 && id !== usuarioId);
-      await OrdemServidorModel.destroy({ where: {}, transaction: t });
+      await OrdemServidorModel.destroy({ where: { escopo: ESCOPO_ORDEM_VETERINARIO }, transaction: t });
       if (idsRestantes.length > 0) {
         await OrdemServidorModel.bulkCreate(
           idsRestantes.map((id, idx) => ({
             usuarioId: id,
             ordem: idx + 1,
+            escopo: ESCOPO_ORDEM_VETERINARIO,
           })),
           { transaction: t },
         );

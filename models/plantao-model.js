@@ -24,6 +24,18 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         field: 'data_referencia',
       },
+      vagaIndice: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+        field: 'vaga_indice',
+      },
+      categoriaPlantao: {
+        type: DataTypes.STRING(24),
+        allowNull: false,
+        defaultValue: 'veterinario',
+        field: 'categoria_plantao',
+      },
       status: { type: DataTypes.STRING(24), allowNull: false, defaultValue: 'previsto' },
       observacao: { type: DataTypes.TEXT, allowNull: true },
       ordemGlobalUsuarioIdsAntes: {

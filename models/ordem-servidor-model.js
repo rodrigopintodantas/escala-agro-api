@@ -18,6 +18,12 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.INTEGER,
         allowNull: false,
       },
+      escopo: {
+        type: DataTypes.STRING(24),
+        allowNull: false,
+        defaultValue: 'veterinario',
+        field: 'escopo',
+      },
     },
     { freezeTableName: true, tableName: 'ordem_servidor', timestamps: true },
   );

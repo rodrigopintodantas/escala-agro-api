@@ -15,6 +15,7 @@ const {
   OrdemServidorModel,
   EscalaOrdemHistoricoModel,
 } = require('../models');
+const { sequelize } = require('../models');
 
 const PERIODICIDADES = ['fim_de_semana', 'diario', 'semanal', 'quinzenal', 'mensal'];
 const REGRA_ORDEM = {
@@ -22,12 +23,60 @@ const REGRA_ORDEM = {
   ADIAR_NO_CICLO: 'adiar_no_ciclo',
 };
 const PAPEIS_VETERINARIO = ['Veterinario', 'Veterinário'];
+const PAPEIS_TECNICO = ['Tecnico', 'Técnico'];
+const CATEGORIA_MEMBRO = { VETERINARIO: 'veterinario', TECNICO: 'tecnico' };
+const CATEGORIA_PLANTAO = { VETERINARIO: 'veterinario', TECNICO: 'tecnico' };
+const ESCOPO_ORDEM = { VETERINARIO: 'veterinario', TECNICO: 'tecnico' };
 
 async function obterPapelVeterinario(transaction) {
   return PapelModel.findOne({
     where: { nome: { [Op.in]: PAPEIS_VETERINARIO } },
     transaction,
   });
+}
+
+async function obterPapelTecnico(transaction) {
+  return PapelModel.findOne({
+    where: { nome: { [Op.in]: PAPEIS_TECNICO } },
+    transaction,
+  });
+}
+
+function categoriaMembroDe(m) {
+  const raw = m && m.get ? m.get('categoriaMembro') : m?.categoriaMembro;
+  const t = String(raw || '').toLowerCase();
+  return t === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
+}
+
+function categoriaPlantaoDe(p) {
+  const raw = p && p.get ? p.get('categoriaPlantao') : p?.categoriaPlantao;
+  const t = String(raw || '').toLowerCase();
+  return t === CATEGORIA_PLANTAO.TECNICO ? CATEGORIA_PLANTAO.TECNICO : CATEGORIA_PLANTAO.VETERINARIO;
+}
+
+function escopoOrdemParaCategoriaMembro(cat) {
+  return String(cat || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? ESCOPO_ORDEM.TECNICO : ESCOPO_ORDEM.VETERINARIO;
+}
+
+async function escopoOrdemGlobalParaUsuarioId(usuarioId, transaction) {
+  const uid = Number(usuarioId);
+  if (!Number.isFinite(uid) || uid < 1) return ESCOPO_ORDEM.VETERINARIO;
+  const rows = await OrdemServidorModel.findAll({
+    where: { usuarioId: uid },
+    attributes: ['escopo'],
+    transaction,
+  });
+  if (rows.some((r) => String(r.escopo || '') === ESCOPO_ORDEM.TECNICO)) return ESCOPO_ORDEM.TECNICO;
+  if (rows.some((r) => String(r.escopo || '') === ESCOPO_ORDEM.VETERINARIO)) return ESCOPO_ORDEM.VETERINARIO;
+  const papelT = await obterPapelTecnico(transaction);
+  if (papelT) {
+    const up = await UsuarioPapelModel.findOne({
+      where: { UsuarioModelId: uid, PapelModelId: papelT.id },
+      transaction,
+    });
+    if (up) return ESCOPO_ORDEM.TECNICO;
+  }
+  return ESCOPO_ORDEM.VETERINARIO;
 }
 
 function dataReferenciaParaStr(v) {
@@ -83,33 +132,82 @@ async function reaplicarRotacaoOrdemGlobalSeEscalaConcluida(escalaId, statusEsca
 
   const membros = await EscalaMembroModel.findAll({
     where: { escalaId, ativo: true },
-    attributes: ['usuarioId', 'ordem'],
-    order: [['ordem', 'ASC']],
-    transaction,
-  });
-  const ordemEscala = membros.map((m) => Number(m.usuarioId)).filter((id) => Number.isFinite(id) && id > 0);
-  if (ordemEscala.length === 0) return false;
-
-  const ultimoPlantao = await PlantaoModel.findOne({
-    where: { escalaId },
+    attributes: ['usuarioId', 'ordem', 'categoriaMembro'],
     order: [
-      ['dataReferencia', 'DESC'],
-      ['id', 'DESC'],
+      [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+      ['ordem', 'ASC'],
     ],
     transaction,
   });
-  if (!ultimoPlantao) return false;
+  const ordemEscalaVet = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  const ordemEscalaTec = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
 
-  const ordemGlobalAtual = await obterOrdemGlobalUsuarioIds(transaction);
-  if (!Array.isArray(ordemGlobalAtual) || ordemGlobalAtual.length === 0) return false;
+  let algumMudou = false;
 
-  const ordemEscalaRotacionada = rotacionarOrdemAposUsuario(ordemEscala, ultimoPlantao.usuarioId);
-  const novaOrdemGlobal = combinarOrdemEscalaNaOrdemGlobal(ordemEscalaRotacionada, ordemGlobalAtual);
-  const mudou = novaOrdemGlobal.join(',') !== ordemGlobalAtual.join(',');
-  if (mudou) {
-    await atualizarOrdemServidoresGlobalSemColisao(novaOrdemGlobal, transaction);
+  if (ordemEscalaVet.length > 0) {
+    const ultimoVet = await PlantaoModel.findOne({
+      where: { escalaId, categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO },
+      order: [
+        ['dataReferencia', 'DESC'],
+        ['id', 'DESC'],
+      ],
+      transaction,
+    });
+    if (ultimoVet) {
+      const ordemGlobalAtual = await obterOrdemGlobalUsuarioIds(transaction, ESCOPO_ORDEM.VETERINARIO);
+      if (Array.isArray(ordemGlobalAtual) && ordemGlobalAtual.length > 0) {
+        const ordemEscalaRotacionada = rotacionarOrdemAposUsuario(ordemEscalaVet, ultimoVet.usuarioId);
+        const novaOrdemGlobal = combinarOrdemEscalaNaOrdemGlobal(ordemEscalaRotacionada, ordemGlobalAtual);
+        if (novaOrdemGlobal.join(',') !== ordemGlobalAtual.join(',')) {
+          await atualizarOrdemServidoresGlobalSemColisao(novaOrdemGlobal, transaction, ESCOPO_ORDEM.VETERINARIO);
+          algumMudou = true;
+        }
+      }
+    }
   }
-  return mudou;
+
+  if (ordemEscalaTec.length > 0) {
+    const ultimoTecPlantao = await PlantaoModel.findOne({
+      where: { escalaId, categoriaPlantao: CATEGORIA_PLANTAO.TECNICO },
+      order: [
+        ['dataReferencia', 'DESC'],
+        ['vagaIndice', 'DESC'],
+        ['id', 'DESC'],
+      ],
+      transaction,
+    });
+    if (ultimoTecPlantao) {
+      const ordemGlobalAtual = await obterOrdemGlobalUsuarioIds(transaction, ESCOPO_ORDEM.TECNICO);
+      if (Array.isArray(ordemGlobalAtual) && ordemGlobalAtual.length > 0) {
+        const dataUlt = dataReferenciaParaStr(ultimoTecPlantao.dataReferencia);
+        const ultimos = await PlantaoModel.findAll({
+          where: { escalaId, dataReferencia: dataUlt, categoriaPlantao: CATEGORIA_PLANTAO.TECNICO },
+          attributes: ['usuarioId'],
+          order: [['id', 'ASC']],
+          transaction,
+        });
+        const uids = [...new Set(ultimos.map((p) => Number(p.usuarioId)).filter((id) => Number.isFinite(id) && id > 0))];
+        uids.sort((a, b) => ordemEscalaTec.indexOf(a) - ordemEscalaTec.indexOf(b));
+        let ordemEscalaRotacionada = [...ordemEscalaTec];
+        for (const uid of uids) {
+          ordemEscalaRotacionada = rotacionarOrdemAposUsuario(ordemEscalaRotacionada, uid);
+        }
+        const novaOrdemGlobal = combinarOrdemEscalaNaOrdemGlobal(ordemEscalaRotacionada, ordemGlobalAtual);
+        if (novaOrdemGlobal.join(',') !== ordemGlobalAtual.join(',')) {
+          await atualizarOrdemServidoresGlobalSemColisao(novaOrdemGlobal, transaction, ESCOPO_ORDEM.TECNICO);
+          algumMudou = true;
+        }
+      }
+    }
+  }
+
+  return algumMudou;
 }
 
 function ehFimDeSemanaDataReferencia(val) {
@@ -118,6 +216,50 @@ function ehFimDeSemanaDataReferencia(val) {
   const d = new Date(`${s}T12:00:00`);
   const dow = d.getDay();
   return dow === 0 || dow === 6;
+}
+
+function ehSabadoDataReferencia(val) {
+  const s = dataReferenciaParaStr(val);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  return new Date(`${s}T12:00:00`).getDay() === 6;
+}
+
+function ehDomingoDataReferencia(val) {
+  const s = dataReferenciaParaStr(val);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  return new Date(`${s}T12:00:00`).getDay() === 0;
+}
+
+function diffDiasEntreReferenciasIso(a, b) {
+  const da = new Date(`${dataReferenciaParaStr(a)}T12:00:00`);
+  const db = new Date(`${dataReferenciaParaStr(b)}T12:00:00`);
+  return Math.round((db.getTime() - da.getTime()) / 86400000);
+}
+
+/**
+ * Em `fim_de_semana`, sábado e o domingo imediatamente seguinte compartilham o mesmo par de técnicos;
+ * o índice do rodízio só avança após o domingo (evita padrão ABBCC… em vez de AABB… ao percorrer as vagas).
+ */
+function fdsSabadoTemDomingoAdjacenteNaLista(datasOrdenadas, indiceSabado) {
+  const sab = datasOrdenadas[indiceSabado];
+  const dom = datasOrdenadas[indiceSabado + 1];
+  if (dom == null) return false;
+  return (
+    ehSabadoDataReferencia(sab) &&
+    ehDomingoDataReferencia(dom) &&
+    diffDiasEntreReferenciasIso(sab, dom) === 1
+  );
+}
+
+/** Quantos passos de `idxT += 2` equivalem às datas `[0 .. indice-1]` (sáb+dom do mesmo fds contam como um passo). */
+function avancosRodizioTecnicoAteIndiceNaLista(datasOrdenadas, indice) {
+  let n = 0;
+  for (let j = 0; j < indice; j++) {
+    if (!fdsSabadoTemDomingoAdjacenteNaLista(datasOrdenadas, j)) {
+      n += 1;
+    }
+  }
+  return n;
 }
 
 function listarDatasFinsDeSemana(dataInicioStr, dataFimStr) {
@@ -246,10 +388,10 @@ function afastamentoEhAbono(af) {
 }
 
 /** Texto exibido no plantão quando o preferencial do dia está só de atestado (ordem do rodízio não muda). */
-function textoGestaoAtestadoMedico(afastamentosPreferencial) {
+function textoGestaoAtestadoMedico(afastamentosPreferencial, rotuloProfissional = 'Veterinário') {
   const af = (afastamentosPreferencial || []).find((a) => afastamentoEhAtestado(a));
   const rawNome = af?.usuario ? af.usuario.nome || af.usuario.login : '';
-  const nome = String(rawNome || '').trim() || 'Veterinário';
+  const nome = String(rawNome || '').trim() || rotuloProfissional;
   return `Gestão - Atestado médico ${nome}`;
 }
 
@@ -334,7 +476,7 @@ function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes, datasNaoU
   if (!Array.isArray(afastamentos) || !Array.isArray(plantoes) || plantoes.length === 0) {
     return mapa;
   }
-  const datasPlantoes = plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia));
+  const datasPlantoes = [...new Set(plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia)))].sort();
   for (const af of afastamentos) {
     const ehFerias = afastamentoEhFerias(af);
     const ehAbono = afastamentoEhAbono(af);
@@ -384,10 +526,13 @@ function escolherRetornoFeriasDoDia(
   return escolhido;
 }
 
-async function obterOrdemAtualDaEscala(escalaId, transaction) {
+async function obterMembrosAtivosEscala(escalaId, transaction) {
   const membros = await EscalaMembroModel.findAll({
     where: { escalaId, ativo: true },
-    order: [['ordem', 'ASC']],
+    order: [
+      [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+      ['ordem', 'ASC'],
+    ],
     transaction,
   });
   if (membros.length === 0) {
@@ -404,6 +549,7 @@ async function registrarHistoricoOrdem({
   motivo,
   tipoAfastamentoId = null,
   afastamentoId = null,
+  categoriaOrdem = null,
   transaction,
 }) {
   await EscalaOrdemHistoricoModel.create(
@@ -412,6 +558,7 @@ async function registrarHistoricoOrdem({
       motivo,
       tipoAfastamentoId,
       afastamentoId,
+      categoriaOrdem: categoriaOrdem || null,
       ordemUsuarioIds: ordemUsuarioIds.map((id) => Number(id)),
       ordemUsuarioIdsAntes:
         Array.isArray(ordemUsuarioIdsAntes) && ordemUsuarioIdsAntes.length > 0
@@ -437,70 +584,89 @@ async function cancelarPermutasPendentesEscala(escalaId, transaction) {
   return permutasCanceladas;
 }
 
-async function atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemUsuarioIds, transaction) {
-  // Passo 1: move todos para ordens temporárias negativas, evitando colisão do índice único (escala_id, ordem).
+async function atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemUsuarioIds, transaction, categoriaMembro = CATEGORIA_MEMBRO.VETERINARIO) {
+  const cat = String(categoriaMembro || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
   for (let i = 0; i < ordemUsuarioIds.length; i++) {
     const usuarioId = Number(ordemUsuarioIds[i]);
     await EscalaMembroModel.update(
       { ordem: -(i + 1) },
       {
-        where: { escalaId, usuarioId },
+        where: { escalaId, usuarioId, categoriaMembro: cat },
         transaction,
       },
     );
   }
 
-  // Passo 2: aplica a ordem final positiva.
   for (let i = 0; i < ordemUsuarioIds.length; i++) {
     const usuarioId = Number(ordemUsuarioIds[i]);
     await EscalaMembroModel.update(
       { ordem: i + 1 },
       {
-        where: { escalaId, usuarioId },
+        where: { escalaId, usuarioId, categoriaMembro: cat },
         transaction,
       },
     );
   }
 }
 
-/** Ordem global de todos os veterinários ativos (tabela `ordem_servidor`), com fallback para novos sem linha. */
-async function obterOrdemGlobalUsuarioIds(transaction) {
-  const papelVet = await obterPapelVeterinario(transaction);
-  if (!papelVet) return [];
+/** Ordem global por escopo (`ordem_servidor.escopo`), com fallback para servidores ativos do papel correspondente. */
+async function obterOrdemGlobalUsuarioIds(transaction, escopo = ESCOPO_ORDEM.VETERINARIO) {
+  const papel =
+    escopo === ESCOPO_ORDEM.TECNICO ? await obterPapelTecnico(transaction) : await obterPapelVeterinario(transaction);
+  if (!papel) return [];
 
-  const vets = await UsuarioModel.findAll({
-    include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papelVet.id } }],
+  const servidores = await UsuarioModel.findAll({
+    include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papel.id } }],
     where: { ativo: true },
     attributes: ['id', 'nome'],
     order: [['nome', 'ASC']],
     transaction,
   });
-  const vetIds = vets.map((v) => Number(v.id));
-  const vetSet = new Set(vetIds);
+  const srvIds = servidores.map((v) => Number(v.id));
+  const srvSet = new Set(srvIds);
 
   const rows = await OrdemServidorModel.findAll({
+    where: { escopo },
     order: [['ordem', 'ASC']],
     transaction,
   });
-  const ordered = rows.map((r) => Number(r.usuarioId)).filter((id) => vetSet.has(id));
+  const ordered = rows.map((r) => Number(r.usuarioId)).filter((id) => srvSet.has(id));
   const inOrdered = new Set(ordered);
-  const missing = vetIds.filter((id) => !inOrdered.has(id));
+  const missing = srvIds.filter((id) => !inOrdered.has(id));
   return [...ordered, ...missing];
 }
 
-/** Persiste ordem global; substitui linhas para evitar colisão de índice único em `ordem`. */
-async function atualizarOrdemServidoresGlobalSemColisao(ordemUsuarioIds, transaction) {
+/** Persiste ordem global do escopo; substitui apenas linhas daquele escopo. */
+async function atualizarOrdemServidoresGlobalSemColisao(ordemUsuarioIds, transaction, escopo = ESCOPO_ORDEM.VETERINARIO) {
   const ids = ordemUsuarioIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0);
   if (ids.length === 0) return;
 
-  await OrdemServidorModel.destroy({ where: {}, transaction });
+  await OrdemServidorModel.destroy({ where: { escopo }, transaction });
   await OrdemServidorModel.bulkCreate(
     ids.map((usuarioId, idx) => ({
       usuarioId,
       ordem: idx + 1,
+      escopo,
     })),
     { transaction },
   );
+}
+
+async function buscarHistoricoOrdemParaAfastamento(escalaId, afastamentoId, categoriaOrdem, transaction) {
+  const cat = String(categoriaOrdem || '').toLowerCase();
+  let hist = await EscalaOrdemHistoricoModel.findOne({
+    where: { escalaId, afastamentoId: Number(afastamentoId), categoriaOrdem: cat },
+    order: [['id', 'DESC']],
+    transaction,
+  });
+  if (!hist) {
+    hist = await EscalaOrdemHistoricoModel.findOne({
+      where: { escalaId, afastamentoId: Number(afastamentoId), categoriaOrdem: { [Op.is]: null } },
+      order: [['id', 'DESC']],
+      transaction,
+    });
+  }
+  return hist;
 }
 
 async function recalcularEscalaInterno(
@@ -529,13 +695,25 @@ async function recalcularEscalaInterno(
   const dataInicioStr = dataReferenciaParaStr(escala.dataInicio);
   const dataFimStr = dataReferenciaParaStr(escala.dataFim);
 
-  const membros = await obterOrdemAtualDaEscala(escalaId, transaction);
-  /** Estado persistido antes deste recálculo (comparação e histórico). */
-  const ordemAtualDbInicial = membros.map((m) => Number(m.usuarioId));
-  let ordemAtual = [...ordemAtualDbInicial];
+  const membros = await obterMembrosAtivosEscala(escalaId, transaction);
+  const ordemAtualDbInicialVet = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  const ordemAtualDbInicialTec = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
 
-  const ordemGlobalDbInicial = await obterOrdemGlobalUsuarioIds(transaction);
-  let ordemGlobal = [...ordemGlobalDbInicial];
+  let ordemAtualVet = [...ordemAtualDbInicialVet];
+  let ordemAtualTec = [...ordemAtualDbInicialTec];
+
+  const ordemGlobalDbInicialVet = await obterOrdemGlobalUsuarioIds(transaction, ESCOPO_ORDEM.VETERINARIO);
+  const ordemGlobalDbInicialTec = await obterOrdemGlobalUsuarioIds(transaction, ESCOPO_ORDEM.TECNICO);
+  let ordemGlobalVet = [...ordemGlobalDbInicialVet];
+  let ordemGlobalTec = [...ordemGlobalDbInicialTec];
+
+  const idsMembrosUniao = [...new Set([...ordemAtualDbInicialVet, ...ordemAtualDbInicialTec])];
 
   /** Inclui datas extras, desfazer afastamento, e afastamento sem bootstrap `maisTarde`. */
   let usarHistoricoInicialRodizio = skipBootstrap || historicoMotivo === 'apos_desfazer_afastamento';
@@ -564,16 +742,20 @@ async function recalcularEscalaInterno(
       .sort((a, b) => dataReferenciaParaStr(a.dataInicio).localeCompare(dataReferenciaParaStr(b.dataInicio)));
     if (maisTarde.length > 0) {
       const primeiro = maisTarde[0];
+      const catPrimeiro =
+        (await escopoOrdemGlobalParaUsuarioId(primeiro.usuarioId, transaction)) === ESCOPO_ORDEM.TECNICO
+          ? CATEGORIA_MEMBRO.TECNICO
+          : CATEGORIA_MEMBRO.VETERINARIO;
       if (Array.isArray(primeiro.ordemGlobalUsuarioIdsAntes) && primeiro.ordemGlobalUsuarioIdsAntes.length > 0) {
-        ordemGlobal = primeiro.ordemGlobalUsuarioIdsAntes.map((x) => Number(x));
+        const og = primeiro.ordemGlobalUsuarioIdsAntes.map((x) => Number(x));
+        if (catPrimeiro === CATEGORIA_MEMBRO.TECNICO) ordemGlobalTec = og;
+        else ordemGlobalVet = og;
       }
-      const hist = await EscalaOrdemHistoricoModel.findOne({
-        where: { escalaId, afastamentoId: Number(primeiro.id) },
-        order: [['id', 'DESC']],
-        transaction,
-      });
+      const hist = await buscarHistoricoOrdemParaAfastamento(escalaId, primeiro.id, catPrimeiro, transaction);
       if (hist && Array.isArray(hist.ordemUsuarioIdsAntes) && hist.ordemUsuarioIdsAntes.length > 0) {
-        ordemAtual = hist.ordemUsuarioIdsAntes.map((x) => Number(x));
+        const oa = hist.ordemUsuarioIdsAntes.map((x) => Number(x));
+        if (catPrimeiro === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = oa;
+        else ordemAtualVet = oa;
       }
     } else {
       usarHistoricoInicialRodizio = true;
@@ -590,7 +772,7 @@ async function recalcularEscalaInterno(
      */
     const sobrepostos = await AfastamentoModel.findAll({
       where: {
-        usuarioId: { [Op.in]: ordemAtualDbInicial },
+        usuarioId: { [Op.in]: idsMembrosUniao },
         dataInicio: { [Op.lte]: dataFimStr },
         dataFim: { [Op.gte]: dataInicioStr },
       },
@@ -602,41 +784,51 @@ async function recalcularEscalaInterno(
     );
     if (ordenados.length > 0) {
       const primeiro = ordenados[0];
+      const catPrimeiro =
+        (await escopoOrdemGlobalParaUsuarioId(primeiro.usuarioId, transaction)) === ESCOPO_ORDEM.TECNICO
+          ? CATEGORIA_MEMBRO.TECNICO
+          : CATEGORIA_MEMBRO.VETERINARIO;
       if (Array.isArray(primeiro.ordemGlobalUsuarioIdsAntes) && primeiro.ordemGlobalUsuarioIdsAntes.length > 0) {
-        ordemGlobal = primeiro.ordemGlobalUsuarioIdsAntes.map((x) => Number(x));
+        const og = primeiro.ordemGlobalUsuarioIdsAntes.map((x) => Number(x));
+        if (catPrimeiro === CATEGORIA_MEMBRO.TECNICO) ordemGlobalTec = og;
+        else ordemGlobalVet = og;
       }
-      const hist = await EscalaOrdemHistoricoModel.findOne({
-        where: { escalaId, afastamentoId: Number(primeiro.id) },
-        order: [['id', 'DESC']],
-        transaction,
-      });
+      const hist = await buscarHistoricoOrdemParaAfastamento(escalaId, primeiro.id, catPrimeiro, transaction);
       if (hist && Array.isArray(hist.ordemUsuarioIdsAntes) && hist.ordemUsuarioIdsAntes.length > 0) {
-        ordemAtual = hist.ordemUsuarioIdsAntes.map((x) => Number(x));
+        const oa = hist.ordemUsuarioIdsAntes.map((x) => Number(x));
+        if (catPrimeiro === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = oa;
+        else ordemAtualVet = oa;
       }
     }
   }
 
   if (usarHistoricoInicialRodizio) {
-    const histInicial = await EscalaOrdemHistoricoModel.findOne({
+    const histsInicial = await EscalaOrdemHistoricoModel.findAll({
       where: { escalaId, motivo: 'inicial' },
       order: [['id', 'ASC']],
       transaction,
     });
-    if (histInicial) {
+    for (const histInicial of histsInicial) {
       const plain = histInicial.get ? histInicial.get({ plain: true }) : histInicial;
-      const idsInicial = Array.isArray(plain.ordemUsuarioIds)
-        ? plain.ordemUsuarioIds.map((x) => Number(x))
-        : [];
-      const membrosSet = new Set(ordemAtualDbInicial);
+      const catRaw = plain.categoriaOrdem;
+      const cat =
+        String(catRaw || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
+      const alvoIds = cat === CATEGORIA_MEMBRO.TECNICO ? ordemAtualDbInicialTec : ordemAtualDbInicialVet;
+      const idsInicial = Array.isArray(plain.ordemUsuarioIds) ? plain.ordemUsuarioIds.map((x) => Number(x)) : [];
+      const membrosSet = new Set(alvoIds);
       if (
         idsInicial.length > 0 &&
-        idsInicial.length === ordemAtualDbInicial.length &&
+        alvoIds.length > 0 &&
+        idsInicial.length === alvoIds.length &&
         idsInicial.every((id) => membrosSet.has(Number(id)))
       ) {
-        ordemAtual = idsInicial;
+        if (cat === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = idsInicial;
+        else ordemAtualVet = idsInicial;
       }
       if (Array.isArray(plain.ordemGlobalUsuarioIds) && plain.ordemGlobalUsuarioIds.length > 0) {
-        ordemGlobal = plain.ordemGlobalUsuarioIds.map((x) => Number(x));
+        const og = plain.ordemGlobalUsuarioIds.map((x) => Number(x));
+        if (cat === CATEGORIA_MEMBRO.TECNICO) ordemGlobalTec = og;
+        else ordemGlobalVet = og;
       }
     }
   }
@@ -645,14 +837,20 @@ async function recalcularEscalaInterno(
     where: { escalaId },
     order: [
       ['dataReferencia', 'ASC'],
+      [sequelize.literal("CASE WHEN categoria_plantao = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+      ['vagaIndice', 'ASC'],
       ['id', 'ASC'],
     ],
     transaction,
   });
 
+  const idsParaAfastamentos = [...new Set([...ordemAtualVet, ...ordemAtualTec, ...ordemAtualDbInicialVet, ...ordemAtualDbInicialTec])].filter(
+    (id) => Number.isFinite(id) && id > 0,
+  );
+
   const afastamentos = await AfastamentoModel.findAll({
     where: {
-      usuarioId: { [Op.in]: ordemAtual },
+      usuarioId: { [Op.in]: idsParaAfastamentos },
       dataInicio: { [Op.lte]: dataFimStr },
       dataFim: { [Op.gte]: dataInicioStr },
     },
@@ -683,14 +881,61 @@ async function recalcularEscalaInterno(
   /** Retornos de férias já vencidos e ainda não alocados (empates no mesmo dia, indisponibilidade etc.). */
   const filaRetornosFeriasPendentes = [];
 
-  let idxOrdem = 0;
+  const primeiroUsuarioNoDiaTech = new Map();
+
+  if (plantoes.some((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO) && ordemAtualDbInicialVet.length === 0) {
+    throw new ApiBaseError('Escala sem veterinários no rodízio para os plantões de veterinário.');
+  }
+  if (plantoes.some((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.TECNICO) && ordemAtualDbInicialTec.length === 0) {
+    throw new ApiBaseError('Escala sem técnicos no rodízio para os plantões de técnico.');
+  }
+
+  const datasEscalaOrdenadas = [
+    ...new Set(plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia)).filter((ds) => /^\d{4}-\d{2}-\d{2}$/.test(String(ds)))),
+  ].sort();
+  const indiceDiaEscala = new Map(datasEscalaOrdenadas.map((ds, i) => [ds, i]));
+  const periodicidadeEhFimDeSemana = String(escala.periodicidade || '').toLowerCase() === 'fim_de_semana';
+
+  let idxOrdemVet = 0;
+  let idxOrdemTec = 0;
   let atualizados = 0;
+  /** `idx` no início do 1.º téc do sábado, quando sáb+dom compartilham par (alinhado à criação com `pular avanço`). */
+  let tecIdxBaseSabadoFds = null;
 
   for (const plantao of plantoes) {
     const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
-    if (!ordemAtual.length) break;
+    const catPlantao = categoriaPlantaoDe(plantao);
+    let ordemAtual = catPlantao === CATEGORIA_PLANTAO.TECNICO ? ordemAtualTec : ordemAtualVet;
+    let ordemGlobal = catPlantao === CATEGORIA_PLANTAO.TECNICO ? ordemGlobalTec : ordemGlobalVet;
+    let idxOrdem = catPlantao === CATEGORIA_PLANTAO.TECNICO ? idxOrdemTec : idxOrdemVet;
+
+    const rotuloProfissional = catPlantao === CATEGORIA_PLANTAO.TECNICO ? 'Técnico' : 'Veterinário';
+    const msgSemServidor = `Não há ${rotuloProfissional.toLowerCase()} disponível para o plantão`;
+
+    if (!ordemAtual.length) continue;
+
+    if (
+      periodicidadeEhFimDeSemana &&
+      catPlantao === CATEGORIA_PLANTAO.TECNICO &&
+      Number(plantao.vagaIndice) === 0
+    ) {
+      const iD0 = indiceDiaEscala.get(dataIso);
+      if (
+        iD0 != null &&
+        ehSabadoDataReferencia(dataIso) &&
+        fdsSabadoTemDomingoAdjacenteNaLista(datasEscalaOrdenadas, iD0)
+      ) {
+        tecIdxBaseSabadoFds = idxOrdem;
+      }
+    }
 
     let observacaoPlantao = null;
+
+    const idsExcluirMesmoDia = new Set();
+    if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 1) {
+      const u0 = primeiroUsuarioNoDiaTech.get(dataIso);
+      if (u0 != null) idsExcluirMesmoDia.add(Number(u0));
+    }
 
     const idxPreferencial = idxOrdem % ordemAtual.length;
     const usuarioPreferencial = ordemAtual[idxPreferencial];
@@ -701,12 +946,15 @@ async function recalcularEscalaInterno(
       dataIso,
       datasNaoUteisParaRetornoPosAfastamento,
     );
-    const preferencialIndisponivel = usuarioIndisponivelParaPlantaoNoDia(
+    let preferencialIndisponivel = usuarioIndisponivelParaPlantaoNoDia(
       afastamentosPorUsuario,
       usuarioPreferencial,
       dataIso,
       datasNaoUteisParaRetornoPosAfastamento,
     );
+    if (idsExcluirMesmoDia.has(Number(usuarioPreferencial))) {
+      preferencialIndisponivel = true;
+    }
 
     let usuarioAlocado = usuarioPreferencial;
     const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
@@ -726,14 +974,8 @@ async function recalcularEscalaInterno(
       datasNaoUteisParaRetornoPosAfastamento,
     );
 
-    if (retornoFeriasForcado != null) {
+    if (retornoFeriasForcado != null && !idsExcluirMesmoDia.has(Number(retornoFeriasForcado))) {
       usuarioAlocado = retornoFeriasForcado;
-      /**
-       * Retorno de férias é uma alocação obrigatória pontual do dia.
-       * Se "fura fila", reposiciona o retornante imediatamente antes do preferencial do dia
-       * e avança normalmente o ciclo. Assim evita duplicação/pulo e mantém consumo de 1 slot
-       * por plantão (rodízio fecha corretamente no mês seguinte).
-       */
       if (Number(usuarioAlocado) !== Number(usuarioPreferencial)) {
         ordemAtual = moverUsuarioAntesDeReferencia(ordemAtual, usuarioAlocado, usuarioPreferencial);
       }
@@ -750,7 +992,7 @@ async function recalcularEscalaInterno(
 
       if (gestaoAtestado) {
         usuarioAlocado = usuarioPreferencial;
-        observacaoPlantao = textoGestaoAtestadoMedico(afastamentosPreferencial);
+        observacaoPlantao = textoGestaoAtestadoMedico(afastamentosPreferencial, rotuloProfissional);
         idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
       } else {
         let encontrado = null;
@@ -758,6 +1000,7 @@ async function recalcularEscalaInterno(
         let afastamentosEncontrado = [];
         for (let passo = 1; passo <= ordemAtual.length; passo++) {
           const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
+          if (idsExcluirMesmoDia.has(Number(candidato))) continue;
           const afastamentosCandidato = afastamentosAtivosNoDia(afastamentosPorUsuario, candidato, dataIso);
           const candidatoBloqueadoPosFeriasOuAbono = usuarioBloqueadoPosFeriasOuAbonoNoDia(
             afastamentosPorUsuario,
@@ -778,12 +1021,12 @@ async function recalcularEscalaInterno(
         }
 
         if (!encontrado) {
-          throw new ApiBaseError(`Não há veterinário disponível para o plantão em ${dataIso}.`);
+          throw new ApiBaseError(`${msgSemServidor} em ${dataIso}.`);
         }
 
         usuarioAlocado = encontrado;
         if (encontradoComGestaoAtestado) {
-          observacaoPlantao = textoGestaoAtestadoMedico(afastamentosEncontrado);
+          observacaoPlantao = textoGestaoAtestadoMedico(afastamentosEncontrado, rotuloProfissional);
         }
         const deveAlterarOrdem =
           afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) || preferencialBloqueadoPosFerias;
@@ -800,41 +1043,100 @@ async function recalcularEscalaInterno(
       idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
     }
 
+    if (
+      periodicidadeEhFimDeSemana &&
+      catPlantao === CATEGORIA_PLANTAO.TECNICO &&
+      Number(plantao.vagaIndice) === 1 &&
+      tecIdxBaseSabadoFds != null &&
+      ehSabadoDataReferencia(dataIso)
+    ) {
+      const iD1 = indiceDiaEscala.get(dataIso);
+      if (iD1 != null && fdsSabadoTemDomingoAdjacenteNaLista(datasEscalaOrdenadas, iD1)) {
+        idxOrdem = tecIdxBaseSabadoFds;
+        tecIdxBaseSabadoFds = null;
+      }
+    }
+
+    if (catPlantao === CATEGORIA_PLANTAO.TECNICO) {
+      ordemAtualTec = ordemAtual;
+      ordemGlobalTec = ordemGlobal;
+      idxOrdemTec = idxOrdem;
+    } else {
+      ordemAtualVet = ordemAtual;
+      ordemGlobalVet = ordemGlobal;
+      idxOrdemVet = idxOrdem;
+    }
+
     const obsDesejada = observacaoPlantao;
     const usuarioMudou = Number(plantao.usuarioId) !== Number(usuarioAlocado);
     const obsMudou = (plantao.observacao || null) !== (obsDesejada || null);
     if (usuarioMudou || obsMudou) {
-      /** Sempre persiste alocação simulada; senão o BD fica defasado e idxOrdem diverge (ex.: desfazer afastamento com persistir a partir da data do afastamento). */
       plantao.usuarioId = Number(usuarioAlocado);
       plantao.observacao = obsDesejada;
       await plantao.save({ transaction });
       atualizados += 1;
     }
+
+    if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 0) {
+      primeiroUsuarioNoDiaTech.set(dataIso, Number(usuarioAlocado));
+    }
   }
 
-  const ordemMudou = ordemAtual.join(',') !== ordemAtualDbInicial.join(',');
-  if (ordemMudou) {
-    await atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemAtual, transaction);
+  const ordemMudouVet = ordemAtualVet.join(',') !== ordemAtualDbInicialVet.join(',');
+  const ordemMudouTec = ordemAtualTec.join(',') !== ordemAtualDbInicialTec.join(',');
+  const ordemMudou = ordemMudouVet || ordemMudouTec;
 
-    if (historicoMotivo) {
+  if (ordemMudouVet && ordemAtualDbInicialVet.length > 0) {
+    await atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemAtualVet, transaction, CATEGORIA_MEMBRO.VETERINARIO);
+  }
+  if (ordemMudouTec && ordemAtualDbInicialTec.length > 0) {
+    await atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemAtualTec, transaction, CATEGORIA_MEMBRO.TECNICO);
+  }
+
+  if (historicoMotivo && ordemMudou) {
+    if (ordemMudouVet && ordemAtualDbInicialVet.length > 0) {
       await registrarHistoricoOrdem({
         escalaId,
-        ordemUsuarioIds: ordemAtual,
-        ordemUsuarioIdsAntes: historicoMotivo === 'afastamento' ? ordemAtualDbInicial : null,
+        ordemUsuarioIds: ordemAtualVet,
+        ordemUsuarioIdsAntes: historicoMotivo === 'afastamento' ? ordemAtualDbInicialVet : null,
         motivo: historicoMotivo,
         tipoAfastamentoId: historicoAfastamento ? historicoAfastamento.tipoId : null,
         afastamentoId: historicoAfastamento ? historicoAfastamento.id : null,
+        categoriaOrdem: CATEGORIA_MEMBRO.VETERINARIO,
+        transaction,
+      });
+    }
+    if (ordemMudouTec && ordemAtualDbInicialTec.length > 0) {
+      await registrarHistoricoOrdem({
+        escalaId,
+        ordemUsuarioIds: ordemAtualTec,
+        ordemUsuarioIdsAntes: historicoMotivo === 'afastamento' ? ordemAtualDbInicialTec : null,
+        motivo: historicoMotivo,
+        tipoAfastamentoId: historicoAfastamento ? historicoAfastamento.tipoId : null,
+        afastamentoId: historicoAfastamento ? historicoAfastamento.id : null,
+        categoriaOrdem: CATEGORIA_MEMBRO.TECNICO,
         transaction,
       });
     }
   }
 
-  const ordemGlobalMudou = ordemGlobal.join(',') !== ordemGlobalDbInicial.join(',');
-  if (ordemGlobalMudou && ordemGlobal.length > 0) {
-    await atualizarOrdemServidoresGlobalSemColisao(ordemGlobal, transaction);
+  const ordemGlobalMudouVet = ordemGlobalVet.join(',') !== ordemGlobalDbInicialVet.join(',');
+  const ordemGlobalMudouTec = ordemGlobalTec.join(',') !== ordemGlobalDbInicialTec.join(',');
+  if (ordemGlobalMudouVet && ordemGlobalVet.length > 0) {
+    await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalVet, transaction, ESCOPO_ORDEM.VETERINARIO);
+  }
+  if (ordemGlobalMudouTec && ordemGlobalTec.length > 0) {
+    await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalTec, transaction, ESCOPO_ORDEM.TECNICO);
   }
 
-  return { atualizados, ordemMudou, ordemUsuarioIds: ordemAtual, ordemGlobalMudou };
+  const ordemGlobalMudou = ordemGlobalMudouVet || ordemGlobalMudouTec;
+
+  return {
+    atualizados,
+    ordemMudou,
+    ordemUsuarioIds: [...ordemAtualVet, ...ordemAtualTec],
+    ordemGlobalMudou,
+  };
 }
 
 /**
@@ -850,7 +1152,8 @@ async function refreshSnapshotsOrdemDeAfastamentosRestantes(transaction, afastam
     const yInicio = dataReferenciaParaStr(row.dataInicio);
     if (!(yInicio < removidoInicio)) continue;
 
-    const og = await obterOrdemGlobalUsuarioIds(transaction);
+    const escopoAf = await escopoOrdemGlobalParaUsuarioId(row.usuarioId, transaction);
+    const og = await obterOrdemGlobalUsuarioIds(transaction, escopoAf);
     await AfastamentoModel.update(
       { ordemGlobalUsuarioIdsAntes: og },
       { where: { id: row.id }, transaction },
@@ -867,11 +1170,19 @@ async function refreshSnapshotsOrdemDeAfastamentosRestantes(transaction, afastam
         transaction,
       });
       if (!temHist) continue;
-      const ordemAtual = (await obterOrdemAtualDaEscala(escalaId, transaction)).map((m) => Number(m.usuarioId));
-      await EscalaOrdemHistoricoModel.update(
-        { ordemUsuarioIdsAntes: ordemAtual },
-        { where: { escalaId, afastamentoId: Number(row.id) }, transaction },
-      );
+      for (const catMem of [CATEGORIA_MEMBRO.VETERINARIO, CATEGORIA_MEMBRO.TECNICO]) {
+        const membrosCat = await EscalaMembroModel.findAll({
+          where: { escalaId, ativo: true, categoriaMembro: catMem },
+          order: [['ordem', 'ASC']],
+          transaction,
+        });
+        const ordemAtual = membrosCat.map((m) => Number(m.usuarioId)).filter((id) => Number.isFinite(id) && id > 0);
+        if (ordemAtual.length === 0) continue;
+        await EscalaOrdemHistoricoModel.update(
+          { ordemUsuarioIdsAntes: ordemAtual },
+          { where: { escalaId, afastamentoId: Number(row.id), categoriaOrdem: catMem }, transaction },
+        );
+      }
     }
   }
 }
@@ -903,53 +1214,72 @@ async function restaurarOrdemEGlobalAntesDesfazerAfastamento(afastamentoPlain, t
 
   /** Nenhum outro afastamento no sistema: volta à ordem gravada em motivo=inicial (escala + ordem geral). */
   if (countOutros === 0) {
-    let ordemGlobalInicial = null;
+    let ordemGlobalInicialVet = null;
+    let ordemGlobalInicialTec = null;
     for (const escalaId of escalaIdsAfetadas) {
-      const histInicial = await EscalaOrdemHistoricoModel.findOne({
+      const histsInicial = await EscalaOrdemHistoricoModel.findAll({
         where: { escalaId, motivo: 'inicial' },
         order: [['id', 'ASC']],
         transaction,
       });
-      if (histInicial && Array.isArray(histInicial.ordemUsuarioIds) && histInicial.ordemUsuarioIds.length > 0) {
-        await atualizarOrdemMembrosEscalaSemColisao(
-          escalaId,
-          histInicial.ordemUsuarioIds.map((x) => Number(x)),
-          transaction,
-        );
-      }
-      if (
-        ordemGlobalInicial == null &&
-        histInicial &&
-        Array.isArray(histInicial.ordemGlobalUsuarioIds) &&
-        histInicial.ordemGlobalUsuarioIds.length > 0
-      ) {
-        ordemGlobalInicial = histInicial.ordemGlobalUsuarioIds.map((x) => Number(x));
+      for (const histInicial of histsInicial) {
+        const plain = histInicial.get ? histInicial.get({ plain: true }) : histInicial;
+        const cat =
+          String(plain.categoriaOrdem || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO
+            ? CATEGORIA_MEMBRO.TECNICO
+            : CATEGORIA_MEMBRO.VETERINARIO;
+        if (Array.isArray(plain.ordemUsuarioIds) && plain.ordemUsuarioIds.length > 0) {
+          await atualizarOrdemMembrosEscalaSemColisao(
+            escalaId,
+            plain.ordemUsuarioIds.map((x) => Number(x)),
+            transaction,
+            cat,
+          );
+        }
+        if (Array.isArray(plain.ordemGlobalUsuarioIds) && plain.ordemGlobalUsuarioIds.length > 0) {
+          const og = plain.ordemGlobalUsuarioIds.map((x) => Number(x));
+          if (cat === CATEGORIA_MEMBRO.TECNICO) ordemGlobalInicialTec = og;
+          else ordemGlobalInicialVet = og;
+        }
       }
     }
-    if ((!ordemGlobalInicial || ordemGlobalInicial.length === 0) && Array.isArray(afastamentoPlain.ordemGlobalUsuarioIdsAntes)) {
+    const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamentoPlain.usuarioId, transaction);
+    if (
+      (!ordemGlobalInicialVet || ordemGlobalInicialVet.length === 0) &&
+      (!ordemGlobalInicialTec || ordemGlobalInicialTec.length === 0) &&
+      Array.isArray(afastamentoPlain.ordemGlobalUsuarioIdsAntes)
+    ) {
       const og = afastamentoPlain.ordemGlobalUsuarioIdsAntes;
-      if (og.length > 0) ordemGlobalInicial = og.map((x) => Number(x));
+      if (og.length > 0) {
+        if (escopoAf === ESCOPO_ORDEM.TECNICO) ordemGlobalInicialTec = og.map((x) => Number(x));
+        else ordemGlobalInicialVet = og.map((x) => Number(x));
+      }
     }
-    if (ordemGlobalInicial && ordemGlobalInicial.length > 0) {
-      await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicial, transaction);
+    if (ordemGlobalInicialVet && ordemGlobalInicialVet.length > 0) {
+      await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicialVet, transaction, ESCOPO_ORDEM.VETERINARIO);
+    }
+    if (ordemGlobalInicialTec && ordemGlobalInicialTec.length > 0) {
+      await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicialTec, transaction, ESCOPO_ORDEM.TECNICO);
     }
     return;
   }
 
-  const visto = new Set();
   for (const h of rowsHist) {
     const eid = Number(h.escalaId);
-    if (visto.has(eid)) continue;
-    visto.add(eid);
     const antes = h.ordemUsuarioIdsAntes;
+    const catH =
+      String(h.categoriaOrdem || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO
+        ? CATEGORIA_MEMBRO.TECNICO
+        : CATEGORIA_MEMBRO.VETERINARIO;
     if (Array.isArray(antes) && antes.length > 0) {
-      await atualizarOrdemMembrosEscalaSemColisao(eid, antes.map((x) => Number(x)), transaction);
+      await atualizarOrdemMembrosEscalaSemColisao(eid, antes.map((x) => Number(x)), transaction, catH);
     }
   }
 
   const og = afastamentoPlain.ordemGlobalUsuarioIdsAntes;
   if (Array.isArray(og) && og.length > 0) {
-    await atualizarOrdemServidoresGlobalSemColisao(og.map((x) => Number(x)), transaction);
+    const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamentoPlain.usuarioId, transaction);
+    await atualizarOrdemServidoresGlobalSemColisao(og.map((x) => Number(x)), transaction, escopoAf);
   }
 }
 
@@ -1164,7 +1494,12 @@ const EscalaService = {
         {
           model: EscalaMembroModel,
           as: 'membros',
-          attributes: ['id', 'ordem', 'usuarioId', 'ativo'],
+          separate: true,
+          order: [
+            [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+            ['ordem', 'ASC'],
+          ],
+          attributes: ['id', 'ordem', 'usuarioId', 'ativo', 'categoriaMembro'],
           include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
         },
       ],
@@ -1176,6 +1511,11 @@ const EscalaService = {
         {
           model: EscalaMembroModel,
           as: 'membros',
+          separate: true,
+          order: [
+            [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+            ['ordem', 'ASC'],
+          ],
           include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'email'] }],
         },
       ],
@@ -1194,6 +1534,8 @@ const EscalaService = {
       include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
       order: [
         ['dataReferencia', 'ASC'],
+        [sequelize.literal("CASE WHEN categoria_plantao = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+        ['vagaIndice', 'ASC'],
         ['id', 'ASC'],
       ],
     });
@@ -1235,57 +1577,132 @@ const EscalaService = {
     if (!escala) throw new ApiBaseError('Escala não encontrada.');
     const dataFimStr = dataReferenciaParaStr(escala.dataFim);
 
-    const ultimoPlantao = await PlantaoModel.findOne({
-      where: { escalaId: eid },
+    const membros = await EscalaMembroModel.findAll({
+      where: { escalaId: eid, ativo: true },
+      attributes: ['usuarioId', 'ordem', 'categoriaMembro'],
+      order: [
+        [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+        ['ordem', 'ASC'],
+      ],
+    });
+    let ordemVet = membros
+      .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+      .map((m) => Number(m.usuarioId))
+      .filter((id) => Number.isFinite(id) && id > 0);
+    let ordemTec = membros
+      .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+      .map((m) => Number(m.usuarioId))
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    if (ordemVet.length === 0) {
+      ordemVet = await obterOrdemGlobalUsuarioIds(undefined, ESCOPO_ORDEM.VETERINARIO);
+    }
+    if (ordemTec.length === 0) {
+      ordemTec = await obterOrdemGlobalUsuarioIds(undefined, ESCOPO_ORDEM.TECNICO);
+    }
+
+    const ultimoVet = await PlantaoModel.findOne({
+      where: { escalaId: eid, categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO },
       order: [
         ['dataReferencia', 'DESC'],
         ['id', 'DESC'],
       ],
     });
-
-    const membros = await EscalaMembroModel.findAll({
-      where: { escalaId: eid, ativo: true },
-      attributes: ['usuarioId', 'ordem'],
-      order: [['ordem', 'ASC']],
-    });
-    let ordemBase = [...new Set(membros.map((m) => Number(m.usuarioId)).filter((id) => Number.isFinite(id) && id > 0))];
-    if (ordemBase.length === 0) {
-      ordemBase = await obterOrdemGlobalUsuarioIds();
-    }
-    if (ordemBase.length === 0) {
-      return { itens: [] };
-    }
-
-    let ordemRotacionada = [...ordemBase];
-    if (ultimoPlantao) {
-      const uid = Number(ultimoPlantao.usuarioId);
-      const idx = ordemRotacionada.indexOf(uid);
+    let rotVet = [...ordemVet];
+    if (ultimoVet && rotVet.length > 0) {
+      const uid = Number(ultimoVet.usuarioId);
+      const idx = rotVet.indexOf(uid);
       if (idx >= 0) {
-        ordemRotacionada = [...ordemRotacionada.slice(idx + 1), ...ordemRotacionada.slice(0, idx + 1)];
+        rotVet = [...rotVet.slice(idx + 1), ...rotVet.slice(0, idx + 1)];
       }
     }
 
+    let rotTec = [...ordemTec];
+    const ultimoTecPlantao = await PlantaoModel.findOne({
+      where: { escalaId: eid, categoriaPlantao: CATEGORIA_PLANTAO.TECNICO },
+      order: [
+        ['dataReferencia', 'DESC'],
+        ['vagaIndice', 'DESC'],
+        ['id', 'DESC'],
+      ],
+    });
+    if (ultimoTecPlantao && rotTec.length > 0) {
+      const dataUlt = dataReferenciaParaStr(ultimoTecPlantao.dataReferencia);
+      const ultimos = await PlantaoModel.findAll({
+        where: { escalaId: eid, dataReferencia: dataUlt, categoriaPlantao: CATEGORIA_PLANTAO.TECNICO },
+        attributes: ['usuarioId'],
+        order: [['id', 'ASC']],
+      });
+      const uids = [...new Set(ultimos.map((p) => Number(p.usuarioId)).filter((id) => Number.isFinite(id) && id > 0))];
+      uids.sort((a, b) => rotTec.indexOf(a) - rotTec.indexOf(b));
+      let ord = [...rotTec];
+      for (const uid of uids) {
+        ord = rotacionarOrdemAposUsuario(ord, uid);
+      }
+      rotTec = ord;
+    }
+
     const datas = proximasDatasFinsDeSemanaApos(dataFimStr, q);
-    const n = ordemRotacionada.length;
-    const idsUnicos = [...new Set(ordemRotacionada)];
+    const nv = rotVet.length;
+    const nt = rotTec.length;
+
+    const idsUnicos = [...new Set([...rotVet, ...rotTec])];
     const usuarios = await UsuarioModel.findAll({
       where: { id: { [Op.in]: idsUnicos } },
       attributes: ['id', 'nome', 'login'],
     });
     const mapa = new Map(usuarios.map((u) => [Number(u.id), u.get({ plain: true })]));
 
-    const itens = datas.map((dataRef, k) => {
-      const usuarioId = ordemRotacionada[k % n];
-      const u = mapa.get(usuarioId);
-      return {
+    const montarItem = (dataRef, usuarioId, segundoUsuarioId = null, terceiroUsuarioId = null) => {
+      const u = mapa.get(Number(usuarioId));
+      const v = segundoUsuarioId != null ? mapa.get(Number(segundoUsuarioId)) : null;
+      const w = terceiroUsuarioId != null ? mapa.get(Number(terceiroUsuarioId)) : null;
+      const out = {
         dataReferencia: dataRef,
-        usuarioId,
+        usuarioId: Number(usuarioId),
         nome: u ? u.nome : null,
         login: u ? u.login : null,
       };
-    });
+      if (segundoUsuarioId != null) {
+        out.segundoUsuarioId = Number(segundoUsuarioId);
+        out.segundoNome = v ? v.nome : null;
+        out.segundoLogin = v ? v.login : null;
+      }
+      if (terceiroUsuarioId != null) {
+        out.terceiroUsuarioId = Number(terceiroUsuarioId);
+        out.terceiroNome = w ? w.nome : null;
+        out.terceiroLogin = w ? w.login : null;
+      }
+      return out;
+    };
 
-    return { itens };
+    if (nv >= 1 && nt >= 2) {
+      const itens = datas.map((dataRef, k) => {
+        const vetId = rotVet[k % nv];
+        const wk = avancosRodizioTecnicoAteIndiceNaLista(datas, k);
+        const t0 = rotTec[(wk * 2) % nt];
+        const t1 = rotTec[(wk * 2 + 1) % nt];
+        return montarItem(dataRef, vetId, t0, t1);
+      });
+      return { itens };
+    }
+
+    if (nv >= 1 && nt === 0) {
+      const itens = datas.map((dataRef, k) => montarItem(dataRef, rotVet[k % nv]));
+      return { itens };
+    }
+
+    if (nv === 0 && nt >= 2) {
+      const itens = datas.map((dataRef, k) => {
+        const wk = avancosRodizioTecnicoAteIndiceNaLista(datas, k);
+        const t0 = rotTec[(wk * 2) % nt];
+        const t1 = rotTec[(wk * 2 + 1) % nt];
+        return montarItem(dataRef, t0, t1);
+      });
+      return { itens };
+    }
+
+    return { itens: [] };
   },
 
   listarVeterinarios: async () => {
@@ -1306,7 +1723,7 @@ const EscalaService = {
     const vetPlain = vets.map((v) => v.get({ plain: true }));
     const ids = vetPlain.map((v) => Number(v.id));
     const ordemRows = await OrdemServidorModel.findAll({
-      where: { usuarioId: { [Op.in]: ids } },
+      where: { usuarioId: { [Op.in]: ids }, escopo: ESCOPO_ORDEM.VETERINARIO },
       order: [['ordem', 'ASC']],
     });
     const ordemMap = new Map(ordemRows.map((r) => [Number(r.usuarioId), Number(r.ordem)]));
@@ -1326,39 +1743,82 @@ const EscalaService = {
       });
   },
 
-  salvarOrdemServidores: async (usuarioIds) => {
+  listarTecnicos: async () => {
+    const papelT = await obterPapelTecnico();
+    if (!papelT) return [];
+
+    const tecs = await UsuarioModel.findAll({
+      include: [
+        {
+          model: UsuarioPapelModel,
+          required: true,
+          where: { PapelModelId: papelT.id },
+        },
+      ],
+      where: { ativo: true },
+      attributes: ['id', 'nome', 'login', 'email', 'cargo'],
+    });
+    const tecPlain = tecs.map((v) => v.get({ plain: true }));
+    const ids = tecPlain.map((v) => Number(v.id));
+    const ordemRows = await OrdemServidorModel.findAll({
+      where: { usuarioId: { [Op.in]: ids }, escopo: ESCOPO_ORDEM.TECNICO },
+      order: [['ordem', 'ASC']],
+    });
+    const ordemMap = new Map(ordemRows.map((r) => [Number(r.usuarioId), Number(r.ordem)]));
+
+    return tecPlain
+      .map((v) => ({
+        ...v,
+        ordemGlobal: ordemMap.has(Number(v.id)) ? ordemMap.get(Number(v.id)) : null,
+      }))
+      .sort((a, b) => {
+        const ao = a.ordemGlobal;
+        const bo = b.ordemGlobal;
+        if (ao != null && bo != null) return ao - bo;
+        if (ao != null) return -1;
+        if (bo != null) return 1;
+        return String(a.nome).localeCompare(String(b.nome), 'pt-BR');
+      });
+  },
+
+  salvarOrdemServidores: async (usuarioIds, escopoParam = ESCOPO_ORDEM.VETERINARIO) => {
+    const escopo =
+      String(escopoParam || '').toLowerCase() === ESCOPO_ORDEM.TECNICO ? ESCOPO_ORDEM.TECNICO : ESCOPO_ORDEM.VETERINARIO;
+
     const ids = Array.isArray(usuarioIds)
       ? [...new Set(usuarioIds.map((x) => parseInt(x, 10)).filter((x) => Number.isFinite(x) && x > 0))]
       : [];
     if (ids.length === 0) throw new ApiBaseError('Informe os IDs dos servidores na ordem desejada.');
 
-    const vets = await EscalaService.listarVeterinarios();
-    const vetIds = vets.map((v) => Number(v.id));
-    if (vetIds.length !== ids.length) {
-      throw new ApiBaseError('A ordem deve conter todos os veterinários ativos, sem repetição.');
+    const lista = escopo === ESCOPO_ORDEM.TECNICO ? await EscalaService.listarTecnicos() : await EscalaService.listarVeterinarios();
+    const rotulo = escopo === ESCOPO_ORDEM.TECNICO ? 'técnicos' : 'veterinários';
+    const permitidos = lista.map((v) => Number(v.id));
+    if (permitidos.length !== ids.length) {
+      throw new ApiBaseError(`A ordem deve conter todos os ${rotulo} ativos, sem repetição.`);
     }
-    const vetSet = new Set(vetIds);
+    const setPerm = new Set(permitidos);
     for (const id of ids) {
-      if (!vetSet.has(Number(id))) {
-        throw new ApiBaseError(`Usuário ${id} não faz parte dos veterinários ativos.`);
+      if (!setPerm.has(Number(id))) {
+        throw new ApiBaseError(`Usuário ${id} não faz parte dos ${rotulo} ativos.`);
       }
     }
 
     return await sequelizeTransaction(async (t) => {
-      await OrdemServidorModel.destroy({ where: {}, transaction: t });
+      await OrdemServidorModel.destroy({ where: { escopo }, transaction: t });
       await OrdemServidorModel.bulkCreate(
         ids.map((usuarioId, idx) => ({
           usuarioId: Number(usuarioId),
           ordem: idx + 1,
+          escopo,
         })),
         { transaction: t },
       );
-      return await EscalaService.listarVeterinarios();
+      return escopo === ESCOPO_ORDEM.TECNICO ? await EscalaService.listarTecnicos() : await EscalaService.listarVeterinarios();
     });
   },
 
   criar: async (payload, criadoPorUsuarioId) => {
-    const { nome, descricao, dataInicio, dataFim, periodicidade, membros, datasPlantaoExtras } = payload;
+    const { nome, descricao, dataInicio, dataFim, periodicidade, membrosVeterinarios, membrosTecnicos, datasPlantaoExtras } = payload;
     if (!nome || !dataInicio || !dataFim || !periodicidade) {
       throw new ApiBaseError('Informe nome, dataInicio, dataFim e periodicidade.');
     }
@@ -1369,30 +1829,66 @@ const EscalaService = {
       throw new ApiBaseError('dataInicio deve ser anterior ou igual a dataFim.');
     }
 
-    let ordemLista = membros;
-    if (!Array.isArray(ordemLista) || ordemLista.length === 0) {
+    const normalizarLista = (arr) => {
+      if (!Array.isArray(arr) || arr.length === 0) return [];
+      return arr
+        .map((m, i) => ({
+          usuarioId: parseInt(m.usuarioId, 10),
+          ordem: m.ordem != null ? parseInt(m.ordem, 10) : i + 1,
+        }))
+        .sort((a, b) => a.ordem - b.ordem);
+    };
+
+    let ordemListaVet = normalizarLista(membrosVeterinarios);
+    let ordemListaTec = normalizarLista(membrosTecnicos);
+
+    if (ordemListaVet.length === 0) {
       const globais = await EscalaService.listarVeterinarios();
-      ordemLista = globais.map((v, i) => ({ usuarioId: Number(v.id), ordem: i + 1 }));
+      ordemListaVet = globais.map((v, i) => ({ usuarioId: Number(v.id), ordem: i + 1 }));
+    }
+    if (ordemListaTec.length === 0) {
+      const globais = await EscalaService.listarTecnicos();
+      ordemListaTec = globais.map((v, i) => ({ usuarioId: Number(v.id), ordem: i + 1 }));
     }
 
-    ordemLista = ordemLista
-      .map((m, i) => ({
-        usuarioId: parseInt(m.usuarioId, 10),
-        ordem: m.ordem != null ? parseInt(m.ordem, 10) : i + 1,
-      }))
-      .sort((a, b) => a.ordem - b.ordem);
-
-    if (ordemLista.some((m) => !Number.isFinite(m.usuarioId) || !Number.isFinite(m.ordem) || m.ordem < 1)) {
-      throw new ApiBaseError('Ordem de membros inválida.');
+    if (ordemListaVet.some((m) => !Number.isFinite(m.usuarioId) || !Number.isFinite(m.ordem) || m.ordem < 1)) {
+      throw new ApiBaseError('Ordem de veterinários inválida.');
     }
-    const ids = new Set(ordemLista.map((m) => m.usuarioId));
-    if (ids.size !== ordemLista.length) throw new ApiBaseError('Não repita o mesmo veterinário na escala.');
+    if (ordemListaTec.some((m) => !Number.isFinite(m.usuarioId) || !Number.isFinite(m.ordem) || m.ordem < 1)) {
+      throw new ApiBaseError('Ordem de técnicos inválida.');
+    }
+    if (new Set(ordemListaVet.map((m) => m.usuarioId)).size !== ordemListaVet.length) {
+      throw new ApiBaseError('Não repita o mesmo veterinário na lista de veterinários.');
+    }
+    if (new Set(ordemListaTec.map((m) => m.usuarioId)).size !== ordemListaTec.length) {
+      throw new ApiBaseError('Não repita o mesmo técnico na lista de técnicos.');
+    }
+    const setVet = new Set(ordemListaVet.map((m) => m.usuarioId));
+    for (const m of ordemListaTec) {
+      if (setVet.has(m.usuarioId)) {
+        throw new ApiBaseError('A mesma pessoa não pode figurar como veterinário e como técnico na mesma escala.');
+      }
+    }
 
-    const vets = await EscalaService.listarVeterinarios();
-    const vetSet = new Set(vets.map((v) => Number(v.id)));
-    for (const m of ordemLista) {
-      if (!vetSet.has(Number(m.usuarioId))) {
+    if (ordemListaVet.length < 1) {
+      throw new ApiBaseError('A escala exige ao menos 1 veterinário.');
+    }
+    if (ordemListaTec.length < 2) {
+      throw new ApiBaseError('A escala exige ao menos 2 técnicos (duas vagas por dia, sem repetir o mesmo servidor no dia).');
+    }
+
+    const permitidosVet = await EscalaService.listarVeterinarios();
+    const permitidosTec = await EscalaService.listarTecnicos();
+    const setPermVet = new Set(permitidosVet.map((v) => Number(v.id)));
+    const setPermTec = new Set(permitidosTec.map((v) => Number(v.id)));
+    for (const m of ordemListaVet) {
+      if (!setPermVet.has(Number(m.usuarioId))) {
         throw new ApiBaseError(`Usuário ${m.usuarioId} não é veterinário no sistema.`);
+      }
+    }
+    for (const m of ordemListaTec) {
+      if (!setPermTec.has(Number(m.usuarioId))) {
+        throw new ApiBaseError(`Usuário ${m.usuarioId} não é técnico no sistema.`);
       }
     }
 
@@ -1431,44 +1927,90 @@ const EscalaService = {
       );
 
       await EscalaMembroModel.bulkCreate(
-        ordemLista.map((m) => ({
-          escalaId: escala.id,
-          usuarioId: m.usuarioId,
-          ordem: m.ordem,
-          ativo: true,
-        })),
+        [
+          ...ordemListaVet.map((m) => ({
+            escalaId: escala.id,
+            usuarioId: m.usuarioId,
+            ordem: m.ordem,
+            categoriaMembro: CATEGORIA_MEMBRO.VETERINARIO,
+            ativo: true,
+          })),
+          ...ordemListaTec.map((m) => ({
+            escalaId: escala.id,
+            usuarioId: m.usuarioId,
+            ordem: m.ordem,
+            categoriaMembro: CATEGORIA_MEMBRO.TECNICO,
+            ativo: true,
+          })),
+        ],
         { transaction: t },
       );
 
       const datas = mergeDatasPlantaoPrevisto(dataInicio, dataFim, datasPlantaoExtras);
-      const n = ordemLista.length;
+      const nv = ordemListaVet.length;
+      const nt = ordemListaTec.length;
+      const periodicidadeEhFimDeSemana = String(periodicidade || '').toLowerCase() === 'fim_de_semana';
       if (datas.length > 0) {
-        await PlantaoModel.bulkCreate(
-          datas.map((dataRef, idx) => ({
-            escalaId: escala.id,
-            usuarioId: ordemLista[idx % n].usuarioId,
-            dataReferencia: dataRef,
-            status: 'previsto',
-          })),
-          { transaction: t },
-        );
+        const rowsPlantao = [];
+        let idxV = 0;
+        let idxT = 0;
+        for (let di = 0; di < datas.length; di++) {
+          const dataRef = datas[di];
+          rowsPlantao.push(
+            {
+              escalaId: escala.id,
+              usuarioId: ordemListaVet[idxV % nv].usuarioId,
+              dataReferencia: dataRef,
+              categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO,
+              vagaIndice: 0,
+              status: 'previsto',
+            },
+            {
+              escalaId: escala.id,
+              usuarioId: ordemListaTec[idxT % nt].usuarioId,
+              dataReferencia: dataRef,
+              categoriaPlantao: CATEGORIA_PLANTAO.TECNICO,
+              vagaIndice: 0,
+              status: 'previsto',
+            },
+            {
+              escalaId: escala.id,
+              usuarioId: ordemListaTec[(idxT + 1) % nt].usuarioId,
+              dataReferencia: dataRef,
+              categoriaPlantao: CATEGORIA_PLANTAO.TECNICO,
+              vagaIndice: 1,
+              status: 'previsto',
+            },
+          );
+          idxV += 1;
+          const pularAvancoTec =
+            periodicidadeEhFimDeSemana && fdsSabadoTemDomingoAdjacenteNaLista(datas, di);
+          if (!pularAvancoTec) {
+            idxT += 2;
+          }
+        }
+        await PlantaoModel.bulkCreate(rowsPlantao, { transaction: t });
       }
 
-      const ordemGlobalInicial = await obterOrdemGlobalUsuarioIds(t);
+      const ordemGlobalInicialVet = await obterOrdemGlobalUsuarioIds(t, ESCOPO_ORDEM.VETERINARIO);
+      const ordemGlobalInicialTec = await obterOrdemGlobalUsuarioIds(t, ESCOPO_ORDEM.TECNICO);
       await registrarHistoricoOrdem({
         escalaId: escala.id,
-        ordemUsuarioIds: ordemLista.map((m) => m.usuarioId),
-        ordemGlobalUsuarioIds: ordemGlobalInicial,
+        ordemUsuarioIds: ordemListaVet.map((m) => m.usuarioId),
+        ordemGlobalUsuarioIds: ordemGlobalInicialVet,
         motivo: 'inicial',
+        categoriaOrdem: CATEGORIA_MEMBRO.VETERINARIO,
+        transaction: t,
+      });
+      await registrarHistoricoOrdem({
+        escalaId: escala.id,
+        ordemUsuarioIds: ordemListaTec.map((m) => m.usuarioId),
+        ordemGlobalUsuarioIds: ordemGlobalInicialTec,
+        motivo: 'inicial',
+        categoriaOrdem: CATEGORIA_MEMBRO.TECNICO,
         transaction: t,
       });
 
-      /**
-       * A geração acima (idx % n) não considera afastamentos já existentes. Sem este passo, um veterinário
-       * pode ficar escalado em dia de afastamento ao criar uma escala nova no período (ex.: Ana em 13/06).
-       * O recálculo aplica substituição e regras de ordem (`adiar_no_ciclo`, etc.), com bootstrap coerente
-       * quando há afastamentos sobrepostos (`historicoMotivo: 'recalculo'`).
-       */
       if (datas.length > 0) {
         await recalcularEscalaInterno(escala.id, {
           transaction: t,
@@ -1512,22 +2054,57 @@ const EscalaService = {
     if (novas.length === 0) throw new ApiBaseError('Todas as datas informadas já possuem plantão nesta escala.');
 
     return await sequelizeTransaction(async (t) => {
-      const membros = await obterOrdemAtualDaEscala(escalaId, t);
-      const primeiroUsuario = Number(membros[0].usuarioId);
-      const ordemEscalaUsuarioIdsAntes = membros.map((m) => Number(m.usuarioId));
-      const ordemGlobalUsuarioIdsAntes = await obterOrdemGlobalUsuarioIds(t);
+      const membros = await obterMembrosAtivosEscala(escalaId, t);
+      const membrosVet = membros.filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO);
+      const membrosTec = membros.filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO);
+      const primeiroVet = membrosVet.length ? Number(membrosVet[0].usuarioId) : null;
+      const primeiroTec = membrosTec.length ? Number(membrosTec[0].usuarioId) : null;
+      const segundoTec = membrosTec.length > 1 ? Number(membrosTec[1].usuarioId) : primeiroTec;
+      const ordemGlobalVetAntes = await obterOrdemGlobalUsuarioIds(t, ESCOPO_ORDEM.VETERINARIO);
+      const ordemGlobalTecAntes = await obterOrdemGlobalUsuarioIds(t, ESCOPO_ORDEM.TECNICO);
+      const ordemEscalaVetAntes = membrosVet.map((m) => Number(m.usuarioId));
+      const ordemEscalaTecAntes = membrosTec.map((m) => Number(m.usuarioId));
 
-      await PlantaoModel.bulkCreate(
-        novas.map((ds) => ({
-          escalaId,
-          usuarioId: primeiroUsuario,
-          dataReferencia: ds,
-          status: 'previsto',
-          ordemGlobalUsuarioIdsAntes,
-          ordemEscalaUsuarioIdsAntes,
-        })),
-        { transaction: t },
-      );
+      const novosPlantoes = [];
+      for (const ds of novas) {
+        if (primeiroVet != null) {
+          novosPlantoes.push({
+            escalaId,
+            usuarioId: primeiroVet,
+            dataReferencia: ds,
+            categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO,
+            vagaIndice: 0,
+            status: 'previsto',
+            ordemGlobalUsuarioIdsAntes: ordemGlobalVetAntes,
+            ordemEscalaUsuarioIdsAntes: ordemEscalaVetAntes,
+          });
+        }
+        if (primeiroTec != null && segundoTec != null) {
+          novosPlantoes.push(
+            {
+              escalaId,
+              usuarioId: primeiroTec,
+              dataReferencia: ds,
+              categoriaPlantao: CATEGORIA_PLANTAO.TECNICO,
+              vagaIndice: 0,
+              status: 'previsto',
+              ordemGlobalUsuarioIdsAntes: ordemGlobalTecAntes,
+              ordemEscalaUsuarioIdsAntes: ordemEscalaTecAntes,
+            },
+            {
+              escalaId,
+              usuarioId: segundoTec,
+              dataReferencia: ds,
+              categoriaPlantao: CATEGORIA_PLANTAO.TECNICO,
+              vagaIndice: 1,
+              status: 'previsto',
+              ordemGlobalUsuarioIdsAntes: ordemGlobalTecAntes,
+              ordemEscalaUsuarioIdsAntes: ordemEscalaTecAntes,
+            },
+          );
+        }
+      }
+      await PlantaoModel.bulkCreate(novosPlantoes, { transaction: t });
 
       const recalc = await recalcularEscalaInterno(escalaId, {
         transaction: t,
@@ -1587,7 +2164,8 @@ const EscalaService = {
     });
     if (!afastamento) throw new ApiBaseError('Afastamento não encontrado para recálculo.');
 
-    const ordemGlobalAntesSnapshot = await obterOrdemGlobalUsuarioIds(transactionExterna || undefined);
+    const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamento.usuarioId, transactionExterna || undefined);
+    const ordemGlobalAntesSnapshot = await obterOrdemGlobalUsuarioIds(transactionExterna || undefined, escopoAf);
 
     const dataInicioStr = dataReferenciaParaStr(afastamento.dataInicio);
     const dataFimStr = dataReferenciaParaStr(afastamento.dataFim);
@@ -1625,6 +2203,9 @@ const EscalaService = {
       PlantaoModel.findOne({ where: { id: did, escalaId } }),
     ]);
     if (!origem || !destino) throw new ApiBaseError('Plantão não encontrado nesta escala.');
+    if (categoriaPlantaoDe(origem) !== CATEGORIA_PLANTAO.VETERINARIO || categoriaPlantaoDe(destino) !== CATEGORIA_PLANTAO.VETERINARIO) {
+      throw new ApiBaseError('Permuta só está disponível entre plantões de veterinário.');
+    }
     if (origem.usuarioId !== solicitanteUsuarioId) throw new ApiBaseError('O plantão de origem deve ser seu.');
     if (destino.usuarioId === solicitanteUsuarioId) {
       throw new ApiBaseError('Escolha o plantão de outro veterinário para solicitar a permuta.');
@@ -1727,33 +2308,86 @@ const EscalaService = {
         throw new ApiBaseError('Somente escalas ativas podem ser concluídas.');
       }
 
-      const ultimoPlantao = await PlantaoModel.findOne({
+      const membros = await EscalaMembroModel.findAll({
+        where: { escalaId, ativo: true },
+        attributes: ['usuarioId', 'ordem', 'categoriaMembro'],
+        order: [
+          [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+          ['ordem', 'ASC'],
+        ],
+        transaction: t,
+      });
+      const ordemEscalaVet = membros
+        .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+        .map((m) => Number(m.usuarioId))
+        .filter((uid) => Number.isFinite(uid) && uid > 0);
+      const ordemEscalaTec = membros
+        .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+        .map((m) => Number(m.usuarioId))
+        .filter((uid) => Number.isFinite(uid) && uid > 0);
+      if (ordemEscalaVet.length === 0 && ordemEscalaTec.length === 0) {
+        throw new ApiBaseError('A escala não possui membros ativos para concluir.');
+      }
+
+      const ultimoPlantaoQualquer = await PlantaoModel.findOne({
         where: { escalaId },
         order: [
           ['dataReferencia', 'DESC'],
+          ['vagaIndice', 'DESC'],
           ['id', 'DESC'],
         ],
         transaction: t,
       });
-      if (!ultimoPlantao) {
+      if (!ultimoPlantaoQualquer) {
         throw new ApiBaseError('Esta escala não possui plantões; não é possível concluir.');
       }
 
-      const membros = await EscalaMembroModel.findAll({
-        where: { escalaId, ativo: true },
-        attributes: ['usuarioId', 'ordem'],
-        order: [['ordem', 'ASC']],
-        transaction: t,
-      });
-      const ordemEscala = membros.map((m) => Number(m.usuarioId)).filter((uid) => Number.isFinite(uid) && uid > 0);
-      if (ordemEscala.length === 0) {
-        throw new ApiBaseError('A escala não possui membros ativos para concluir.');
+      if (ordemEscalaVet.length > 0) {
+        const ultimoVet = await PlantaoModel.findOne({
+          where: { escalaId, categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO },
+          order: [
+            ['dataReferencia', 'DESC'],
+            ['id', 'DESC'],
+          ],
+          transaction: t,
+        });
+        if (ultimoVet) {
+          const ordemGlobal = await obterOrdemGlobalUsuarioIds(t, ESCOPO_ORDEM.VETERINARIO);
+          const ordemEscalaRotacionada = rotacionarOrdemAposUsuario(ordemEscalaVet, ultimoVet.usuarioId);
+          const novaOrdemGlobal = combinarOrdemEscalaNaOrdemGlobal(ordemEscalaRotacionada, ordemGlobal);
+          await atualizarOrdemServidoresGlobalSemColisao(novaOrdemGlobal, t, ESCOPO_ORDEM.VETERINARIO);
+        }
       }
 
-      const ordemGlobal = await obterOrdemGlobalUsuarioIds(t);
-      const ordemEscalaRotacionada = rotacionarOrdemAposUsuario(ordemEscala, ultimoPlantao.usuarioId);
-      const novaOrdemGlobal = combinarOrdemEscalaNaOrdemGlobal(ordemEscalaRotacionada, ordemGlobal);
-      await atualizarOrdemServidoresGlobalSemColisao(novaOrdemGlobal, t);
+      if (ordemEscalaTec.length > 0) {
+        const ultimoTecPlantao = await PlantaoModel.findOne({
+          where: { escalaId, categoriaPlantao: CATEGORIA_PLANTAO.TECNICO },
+          order: [
+            ['dataReferencia', 'DESC'],
+            ['vagaIndice', 'DESC'],
+            ['id', 'DESC'],
+          ],
+          transaction: t,
+        });
+        if (ultimoTecPlantao) {
+          const ordemGlobal = await obterOrdemGlobalUsuarioIds(t, ESCOPO_ORDEM.TECNICO);
+          const dataUlt = dataReferenciaParaStr(ultimoTecPlantao.dataReferencia);
+          const ultimos = await PlantaoModel.findAll({
+            where: { escalaId, dataReferencia: dataUlt, categoriaPlantao: CATEGORIA_PLANTAO.TECNICO },
+            attributes: ['usuarioId'],
+            order: [['id', 'ASC']],
+            transaction: t,
+          });
+          const uids = [...new Set(ultimos.map((p) => Number(p.usuarioId)).filter((id) => Number.isFinite(id) && id > 0))];
+          uids.sort((a, b) => ordemEscalaTec.indexOf(a) - ordemEscalaTec.indexOf(b));
+          let ordemEscalaRotacionada = [...ordemEscalaTec];
+          for (const uid of uids) {
+            ordemEscalaRotacionada = rotacionarOrdemAposUsuario(ordemEscalaRotacionada, uid);
+          }
+          const novaOrdemGlobal = combinarOrdemEscalaNaOrdemGlobal(ordemEscalaRotacionada, ordemGlobal);
+          await atualizarOrdemServidoresGlobalSemColisao(novaOrdemGlobal, t, ESCOPO_ORDEM.TECNICO);
+        }
+      }
 
       escala.status = 'concluida';
       await escala.save({ transaction: t });
@@ -1786,36 +2420,39 @@ const EscalaService = {
       const escalaId = Number(esc.id);
       const membrosEscala = await EscalaMembroModel.findAll({
         where: { escalaId },
-        attributes: ['id', 'usuarioId', 'ordem'],
+        attributes: ['id', 'usuarioId', 'ordem', 'categoriaMembro', 'ativo'],
         order: [
+          [sequelize.literal("CASE WHEN categoria_membro = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
           ['ordem', 'ASC'],
           ['id', 'ASC'],
         ],
         transaction,
       });
-      const idsAtivos = membrosEscala
-        .map((m) => Number(m.usuarioId))
-        .filter((id) => Number.isFinite(id) && id > 0);
-      if (!idsAtivos.includes(usuarioId)) continue;
-      if (idsAtivos.length <= 1) {
-        throw new ApiBaseError('Não é possível excluir o último veterinário de uma escala ativa.');
+      const ativoRows = membrosEscala.filter((m) => m.ativo);
+      const alvo = ativoRows.find((m) => Number(m.usuarioId) === usuarioId);
+      if (!alvo) continue;
+      const catRem = categoriaMembroDe(alvo);
+      const ativosMesmaCat = ativoRows.filter((m) => categoriaMembroDe(m) === catRem);
+      const minNaCat = catRem === CATEGORIA_MEMBRO.TECNICO ? 2 : 1;
+      if (ativosMesmaCat.length <= minNaCat) {
+        throw new ApiBaseError(
+          catRem === CATEGORIA_MEMBRO.TECNICO
+            ? 'Não é possível excluir o técnico: a escala ativa precisa de pelo menos 2 técnicos.'
+            : 'Não é possível excluir o último veterinário de uma escala ativa.',
+        );
       }
 
-      /**
-       * Evita colisão em (escala_id, ordem):
-       * 1) move TODOS os membros da escala para ordens temporárias negativas e únicas;
-       * 2) desativa o veterinário removido;
-       * 3) reaplica ordens positivas para os ativos remanescentes.
-       */
-      for (let i = 0; i < membrosEscala.length; i++) {
-        const usuarioTmp = Number(membrosEscala[i].usuarioId);
-        await EscalaMembroModel.update(
-          { ordem: -(i + 1) },
-          {
-            where: { escalaId, usuarioId: usuarioTmp },
-            transaction,
-          },
-        );
+      for (const cat of [CATEGORIA_MEMBRO.VETERINARIO, CATEGORIA_MEMBRO.TECNICO]) {
+        const rowsCat = membrosEscala.filter((m) => categoriaMembroDe(m) === cat);
+        for (let i = 0; i < rowsCat.length; i++) {
+          await EscalaMembroModel.update(
+            { ordem: -(i + 1) },
+            {
+              where: { id: Number(rowsCat[i].id), escalaId },
+              transaction,
+            },
+          );
+        }
       }
 
       await EscalaMembroModel.update(
@@ -1826,26 +2463,24 @@ const EscalaService = {
         },
       );
 
-      const idsRestantes = idsAtivos.filter((id) => id !== usuarioId).map((id) => Number(id));
-      for (let i = 0; i < idsRestantes.length; i++) {
-        await EscalaMembroModel.update(
-          { ordem: i + 1 },
-          {
-            where: { escalaId, usuarioId: idsRestantes[i], ativo: true },
-            transaction,
-          },
-        );
+      for (const cat of [CATEGORIA_MEMBRO.VETERINARIO, CATEGORIA_MEMBRO.TECNICO]) {
+        const restantes = await EscalaMembroModel.findAll({
+          where: { escalaId, ativo: true, categoriaMembro: cat },
+          order: [['ordem', 'ASC']],
+          transaction,
+        });
+        const idsOrd = restantes.map((m) => Number(m.usuarioId)).filter((id) => Number.isFinite(id) && id > 0);
+        if (idsOrd.length > 0) {
+          await atualizarOrdemMembrosEscalaSemColisao(escalaId, idsOrd, transaction, cat);
+        }
       }
 
-      /**
-       * Inativos não podem compartilhar a mesma faixa de ordens usada no recálculo.
-       * Joga cada inativo para uma ordem alta e única por `id`, evitando colisão com
-       * `atualizarOrdemMembrosEscalaSemColisao` (que usa ordens temporárias negativas).
-       */
-      const idsRestantesSet = new Set(idsRestantes);
-      for (const m of membrosEscala) {
-        const uid = Number(m.usuarioId);
-        if (idsRestantesSet.has(uid)) continue;
+      const inativos = await EscalaMembroModel.findAll({
+        where: { escalaId, ativo: false },
+        attributes: ['id'],
+        transaction,
+      });
+      for (const m of inativos) {
         await EscalaMembroModel.update(
           { ordem: 1000000 + Number(m.id) },
           {

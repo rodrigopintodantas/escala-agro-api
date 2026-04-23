@@ -43,6 +43,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         field: 'ordem_global_usuario_ids',
       },
+      categoriaOrdem: {
+        type: DataTypes.STRING(24),
+        allowNull: true,
+        field: 'categoria_ordem',
+      },
     },
     { freezeTableName: true, tableName: 'escala_ordem_historico', timestamps: true },
   );

@@ -8,6 +8,7 @@ const somenteAdmin = authorize([_ROLES.ADMIN]);
 
 /** Leitura: admin ou veterinário. Alteração / lista para criar escala: só admin. */
 router.get('/veterinarios', somenteAdmin, ctl.listarVeterinarios);
+router.get('/tecnicos', somenteAdmin, ctl.listarTecnicos);
 router.get('/ordem-servidores', somenteAdmin, ctl.listarOrdemServidores);
 router.put('/ordem-servidores', somenteAdmin, ctl.salvarOrdemServidores);
 router.get('/permutas', ctl.listarPermutas);

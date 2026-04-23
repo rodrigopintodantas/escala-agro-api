@@ -32,9 +32,20 @@ const listarVeterinarios = async (req, res, next) => {
   }
 };
 
+const listarTecnicos = async (req, res, next) => {
+  try {
+    const lista = await EscalaService.listarTecnicos();
+    res.status(200).json(lista);
+  } catch (err) {
+    next(err);
+  }
+};
+
 const listarOrdemServidores = async (req, res, next) => {
   try {
-    const lista = await EscalaService.listarVeterinarios();
+    const escopo = req.query && String(req.query.escopo || '').toLowerCase() === 'tecnico' ? 'tecnico' : 'veterinario';
+    const lista =
+      escopo === 'tecnico' ? await EscalaService.listarTecnicos() : await EscalaService.listarVeterinarios();
     res.status(200).json(lista);
   } catch (err) {
     next(err);
@@ -44,7 +55,8 @@ const listarOrdemServidores = async (req, res, next) => {
 const salvarOrdemServidores = async (req, res, next) => {
   try {
     const usuarioIds = req.body && Array.isArray(req.body.usuarioIds) ? req.body.usuarioIds : [];
-    const lista = await EscalaService.salvarOrdemServidores(usuarioIds);
+    const escopo = req.body && req.body.escopo != null ? String(req.body.escopo).toLowerCase() : 'veterinario';
+    const lista = await EscalaService.salvarOrdemServidores(usuarioIds, escopo);
     res.status(200).json(lista);
   } catch (err) {
     next(err);
@@ -195,6 +207,7 @@ module.exports = {
   listar,
   listarPermutas,
   listarVeterinarios,
+  listarTecnicos,
   listarOrdemServidores,
   salvarOrdemServidores,
   consultar,

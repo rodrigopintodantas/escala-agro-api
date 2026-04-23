@@ -20,6 +20,12 @@ module.exports = (sequelize, DataTypes) => {
         field: 'usuario_id',
       },
       ordem: { type: DataTypes.INTEGER, allowNull: false },
+      categoriaMembro: {
+        type: DataTypes.STRING(24),
+        allowNull: false,
+        defaultValue: 'veterinario',
+        field: 'categoria_membro',
+      },
       ativo: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
     },
     { freezeTableName: true, tableName: 'escala_membro', timestamps: true },
