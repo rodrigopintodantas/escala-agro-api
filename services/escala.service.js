@@ -236,32 +236,6 @@ function diffDiasEntreReferenciasIso(a, b) {
   return Math.round((db.getTime() - da.getTime()) / 86400000);
 }
 
-/**
- * Em `fim_de_semana`, sábado e o domingo imediatamente seguinte compartilham o mesmo par de técnicos;
- * o índice do rodízio só avança após o domingo (evita padrão ABBCC… em vez de AABB… ao percorrer as vagas).
- */
-function fdsSabadoTemDomingoAdjacenteNaLista(datasOrdenadas, indiceSabado) {
-  const sab = datasOrdenadas[indiceSabado];
-  const dom = datasOrdenadas[indiceSabado + 1];
-  if (dom == null) return false;
-  return (
-    ehSabadoDataReferencia(sab) &&
-    ehDomingoDataReferencia(dom) &&
-    diffDiasEntreReferenciasIso(sab, dom) === 1
-  );
-}
-
-/** Quantos passos de `idxT += 2` equivalem às datas `[0 .. indice-1]` (sáb+dom do mesmo fds contam como um passo). */
-function avancosRodizioTecnicoAteIndiceNaLista(datasOrdenadas, indice) {
-  let n = 0;
-  for (let j = 0; j < indice; j++) {
-    if (!fdsSabadoTemDomingoAdjacenteNaLista(datasOrdenadas, j)) {
-      n += 1;
-    }
-  }
-  return n;
-}
-
 function listarDatasFinsDeSemana(dataInicioStr, dataFimStr) {
   const out = [];
   const cur = new Date(`${dataInicioStr}T12:00:00`);
@@ -369,6 +343,15 @@ function normalizarTextoSemAcento(v) {
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
     .toLowerCase();
+}
+
+function compararUsuariosPorNomeAlfabetico(a, b) {
+  const nomeA = String(a?.nome || '');
+  const nomeB = String(b?.nome || '');
+  const normA = normalizarTextoSemAcento(nomeA);
+  const normB = normalizarTextoSemAcento(nomeB);
+  if (normA !== normB) return normA.localeCompare(normB, 'pt-BR');
+  return nomeA.localeCompare(nomeB, 'pt-BR');
 }
 
 function tipoAfastamentoNormalizado(af) {
@@ -619,10 +602,10 @@ async function obterOrdemGlobalUsuarioIds(transaction, escopo = ESCOPO_ORDEM.VET
     include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papel.id } }],
     where: { ativo: true },
     attributes: ['id', 'nome'],
-    order: [['nome', 'ASC']],
     transaction,
   });
-  const srvIds = servidores.map((v) => Number(v.id));
+  const servidoresOrdenados = [...servidores].sort((a, b) => compararUsuariosPorNomeAlfabetico(a, b));
+  const srvIds = servidoresOrdenados.map((v) => Number(v.id));
   const srvSet = new Set(srvIds);
 
   const rows = await OrdemServidorModel.findAll({
@@ -890,17 +873,9 @@ async function recalcularEscalaInterno(
     throw new ApiBaseError('Escala sem técnicos no rodízio para os plantões de técnico.');
   }
 
-  const datasEscalaOrdenadas = [
-    ...new Set(plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia)).filter((ds) => /^\d{4}-\d{2}-\d{2}$/.test(String(ds)))),
-  ].sort();
-  const indiceDiaEscala = new Map(datasEscalaOrdenadas.map((ds, i) => [ds, i]));
-  const periodicidadeEhFimDeSemana = String(escala.periodicidade || '').toLowerCase() === 'fim_de_semana';
-
   let idxOrdemVet = 0;
   let idxOrdemTec = 0;
   let atualizados = 0;
-  /** `idx` no início do 1.º téc do sábado, quando sáb+dom compartilham par (alinhado à criação com `pular avanço`). */
-  let tecIdxBaseSabadoFds = null;
 
   for (const plantao of plantoes) {
     const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
@@ -913,21 +888,6 @@ async function recalcularEscalaInterno(
     const msgSemServidor = `Não há ${rotuloProfissional.toLowerCase()} disponível para o plantão`;
 
     if (!ordemAtual.length) continue;
-
-    if (
-      periodicidadeEhFimDeSemana &&
-      catPlantao === CATEGORIA_PLANTAO.TECNICO &&
-      Number(plantao.vagaIndice) === 0
-    ) {
-      const iD0 = indiceDiaEscala.get(dataIso);
-      if (
-        iD0 != null &&
-        ehSabadoDataReferencia(dataIso) &&
-        fdsSabadoTemDomingoAdjacenteNaLista(datasEscalaOrdenadas, iD0)
-      ) {
-        tecIdxBaseSabadoFds = idxOrdem;
-      }
-    }
 
     let observacaoPlantao = null;
 
@@ -961,6 +921,12 @@ async function recalcularEscalaInterno(
     for (const uidRaw of retornosHoje) {
       const uid = Number(uidRaw);
       if (!Number.isFinite(uid)) continue;
+      /**
+       * Fila de retornos é compartilhada no loop de plantões (vet/téc).
+       * Evita inserir retorno de uma categoria quando o plantão atual é da outra,
+       * senão o usuário pode "sobrar" pendente e ser forçado novamente no dia seguinte.
+       */
+      if (!ordemAtual.includes(uid)) continue;
       if (!filaRetornosFeriasPendentes.includes(uid)) {
         filaRetornosFeriasPendentes.push(uid);
       }
@@ -1041,20 +1007,6 @@ async function recalcularEscalaInterno(
       }
     } else {
       idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
-    }
-
-    if (
-      periodicidadeEhFimDeSemana &&
-      catPlantao === CATEGORIA_PLANTAO.TECNICO &&
-      Number(plantao.vagaIndice) === 1 &&
-      tecIdxBaseSabadoFds != null &&
-      ehSabadoDataReferencia(dataIso)
-    ) {
-      const iD1 = indiceDiaEscala.get(dataIso);
-      if (iD1 != null && fdsSabadoTemDomingoAdjacenteNaLista(datasEscalaOrdenadas, iD1)) {
-        idxOrdem = tecIdxBaseSabadoFds;
-        tecIdxBaseSabadoFds = null;
-      }
     }
 
     if (catPlantao === CATEGORIA_PLANTAO.TECNICO) {
@@ -1679,9 +1631,8 @@ const EscalaService = {
     if (nv >= 1 && nt >= 2) {
       const itens = datas.map((dataRef, k) => {
         const vetId = rotVet[k % nv];
-        const wk = avancosRodizioTecnicoAteIndiceNaLista(datas, k);
-        const t0 = rotTec[(wk * 2) % nt];
-        const t1 = rotTec[(wk * 2 + 1) % nt];
+        const t0 = rotTec[(k * 2) % nt];
+        const t1 = rotTec[(k * 2 + 1) % nt];
         return montarItem(dataRef, vetId, t0, t1);
       });
       return { itens };
@@ -1694,9 +1645,8 @@ const EscalaService = {
 
     if (nv === 0 && nt >= 2) {
       const itens = datas.map((dataRef, k) => {
-        const wk = avancosRodizioTecnicoAteIndiceNaLista(datas, k);
-        const t0 = rotTec[(wk * 2) % nt];
-        const t1 = rotTec[(wk * 2 + 1) % nt];
+        const t0 = rotTec[(k * 2) % nt];
+        const t1 = rotTec[(k * 2 + 1) % nt];
         return montarItem(dataRef, t0, t1);
       });
       return { itens };
@@ -1739,7 +1689,7 @@ const EscalaService = {
         if (ao != null && bo != null) return ao - bo;
         if (ao != null) return -1;
         if (bo != null) return 1;
-        return String(a.nome).localeCompare(String(b.nome), 'pt-BR');
+        return compararUsuariosPorNomeAlfabetico(a, b);
       });
   },
 
@@ -1777,7 +1727,7 @@ const EscalaService = {
         if (ao != null && bo != null) return ao - bo;
         if (ao != null) return -1;
         if (bo != null) return 1;
-        return String(a.nome).localeCompare(String(b.nome), 'pt-BR');
+        return compararUsuariosPorNomeAlfabetico(a, b);
       });
   },
 
@@ -1949,7 +1899,6 @@ const EscalaService = {
       const datas = mergeDatasPlantaoPrevisto(dataInicio, dataFim, datasPlantaoExtras);
       const nv = ordemListaVet.length;
       const nt = ordemListaTec.length;
-      const periodicidadeEhFimDeSemana = String(periodicidade || '').toLowerCase() === 'fim_de_semana';
       if (datas.length > 0) {
         const rowsPlantao = [];
         let idxV = 0;
@@ -1983,11 +1932,7 @@ const EscalaService = {
             },
           );
           idxV += 1;
-          const pularAvancoTec =
-            periodicidadeEhFimDeSemana && fdsSabadoTemDomingoAdjacenteNaLista(datas, di);
-          if (!pularAvancoTec) {
-            idxT += 2;
-          }
+          idxT += 2;
         }
         await PlantaoModel.bulkCreate(rowsPlantao, { transaction: t });
       }
