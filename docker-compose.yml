@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: escala
       POSTGRES_DB: escala_agro
     ports:
-      - '5432:5432'
+      - '5545:5432'
     volumes:
       - escala_agro_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,7 +18,7 @@ services:
   api:
     build: .
     ports:
-      - '3000:3000'
+      - '4001:3000'
     environment:
       NODE_ENV: stage
       DOCKER_CONTAINER: 'true'
