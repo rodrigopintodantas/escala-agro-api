@@ -489,6 +489,7 @@ function escolherRetornoFeriasDoDia(
   afastamentosPorUsuario,
   dataIso,
   datasNaoUteisIsoSet = new Set(),
+  idsExcluirMesmoDia = new Set(),
 ) {
   if (!Array.isArray(retornosHoje) || retornosHoje.length === 0 || ordemAtual.length === 0) {
     return null;
@@ -497,6 +498,7 @@ function escolherRetornoFeriasDoDia(
   let menorDistancia = Number.MAX_SAFE_INTEGER;
   for (const uidRaw of retornosHoje) {
     const uid = Number(uidRaw);
+    if (idsExcluirMesmoDia.has(uid)) continue;
     const idx = ordemAtual.indexOf(uid);
     if (idx < 0) continue;
     if (usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet)) continue;
@@ -927,6 +929,8 @@ async function recalcularEscalaInterno(
        * senão o usuário pode "sobrar" pendente e ser forçado novamente no dia seguinte.
        */
       if (!ordemAtual.includes(uid)) continue;
+      /** Em técnicos, evita re-enfileirar na vaga 1 quem já entrou na vaga 0 do mesmo dia. */
+      if (idsExcluirMesmoDia.has(uid)) continue;
       if (!filaRetornosFeriasPendentes.includes(uid)) {
         filaRetornosFeriasPendentes.push(uid);
       }
@@ -938,6 +942,7 @@ async function recalcularEscalaInterno(
       afastamentosPorUsuario,
       dataIso,
       datasNaoUteisParaRetornoPosAfastamento,
+      idsExcluirMesmoDia,
     );
 
     if (retornoFeriasForcado != null && !idsExcluirMesmoDia.has(Number(retornoFeriasForcado))) {
@@ -946,10 +951,6 @@ async function recalcularEscalaInterno(
         ordemAtual = moverUsuarioAntesDeReferencia(ordemAtual, usuarioAlocado, usuarioPreferencial);
       }
       idxOrdem = (ordemAtual.indexOf(usuarioAlocado) + 1) % ordemAtual.length;
-      const idxFila = filaRetornosFeriasPendentes.indexOf(Number(usuarioAlocado));
-      if (idxFila >= 0) {
-        filaRetornosFeriasPendentes.splice(idxFila, 1);
-      }
     } else if (preferencialIndisponivel) {
       const gestaoAtestado =
         !preferencialBloqueadoPosFerias &&
@@ -1020,6 +1021,10 @@ async function recalcularEscalaInterno(
     }
 
     const obsDesejada = observacaoPlantao;
+    const idxFila = filaRetornosFeriasPendentes.indexOf(Number(usuarioAlocado));
+    if (idxFila >= 0) {
+      filaRetornosFeriasPendentes.splice(idxFila, 1);
+    }
     const usuarioMudou = Number(plantao.usuarioId) !== Number(usuarioAlocado);
     const obsMudou = (plantao.observacao || null) !== (obsDesejada || null);
     if (usuarioMudou || obsMudou) {
@@ -2469,6 +2474,12 @@ const EscalaService = {
     });
     return true;
   },
+};
+
+EscalaService.__testables = {
+  escolherRetornoFeriasDoDia,
+  montarRetornosFeriasNoPrimeiroPlantao,
+  usuarioIndisponivelParaPlantaoNoDia,
 };
 
 module.exports = EscalaService;
