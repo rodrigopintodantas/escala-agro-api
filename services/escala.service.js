@@ -677,12 +677,13 @@ async function registrarEventoAuditoriaEscala({
       categoriaMembro: String(categoriaMembro || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO,
       tipoEvento: String(tipoEvento || 'recalculo'),
       referenciaTipo: referenciaTipo || null,
-      referenciaId: Number.isFinite(Number(referenciaId)) ? Number(referenciaId) : null,
+      referenciaId: Number.isFinite(Number(referenciaId)) && Number(referenciaId) > 0 ? Number(referenciaId) : null,
       dataReferencia: dataReferencia ? dataReferenciaParaStr(dataReferencia) : null,
       ordemAntesUsuarioIds: ordemAntes,
       ordemDepoisUsuarioIds: ordemDepois,
       detalhes: detalhes || null,
-      criadoPorUsuarioId: Number.isFinite(Number(criadoPorUsuarioId)) ? Number(criadoPorUsuarioId) : null,
+      criadoPorUsuarioId:
+        Number.isFinite(Number(criadoPorUsuarioId)) && Number(criadoPorUsuarioId) > 0 ? Number(criadoPorUsuarioId) : null,
     },
     { transaction },
   );
@@ -1175,6 +1176,10 @@ async function recalcularEscalaInterno(
     atualizados,
     ordemMudou,
     ordemUsuarioIds: [...ordemAtualVet, ...ordemAtualTec],
+    ordemAtualVet,
+    ordemAtualTec,
+    ordemInicialVet: ordemAtualDbInicialVet,
+    ordemInicialTec: ordemAtualDbInicialTec,
     ordemGlobalMudou,
   };
 }
@@ -1826,9 +1831,8 @@ const EscalaService = {
       String(categoriaParam || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
 
     const escalas = await EscalaModel.findAll({
-      where: { status: 'ativa' },
       attributes: ['id', 'nome', 'dataInicio', 'dataFim', 'status'],
-      order: [['dataInicio', 'ASC']],
+      order: [['dataInicio', 'DESC']],
     });
     if (escalas.length === 0) return [];
 
@@ -2182,16 +2186,84 @@ const EscalaService = {
       });
 
       if (datas.length > 0) {
-        await recalcularEscalaInterno(escala.id, {
+        const recalcCriacao = await recalcularEscalaInterno(escala.id, {
           transaction: t,
           historicoMotivo: 'recalculo',
-          auditoriaContexto: {
-            tipoEvento: 'recalculo_criacao',
+        });
+
+        const idsVet = ordemListaVet.map((m) => Number(m.usuarioId)).filter((id) => Number.isFinite(id) && id > 0);
+        const idsTec = ordemListaTec.map((m) => Number(m.usuarioId)).filter((id) => Number.isFinite(id) && id > 0);
+        const afastamentosSobrepostos = await AfastamentoModel.findAll({
+          where: {
+            usuarioId: { [Op.in]: [...new Set([...idsVet, ...idsTec])] },
+            dataInicio: { [Op.lte]: dataFim },
+            dataFim: { [Op.gte]: dataInicio },
+          },
+          include: [
+            { model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] },
+            { model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo'] },
+          ],
+          transaction: t,
+        });
+        const afVet = afastamentosSobrepostos
+          .filter((af) => idsVet.includes(Number(af.usuarioId)))
+          .map((af) => {
+            const p = af.get ? af.get({ plain: true }) : af;
+            return {
+              afastamentoId: Number(p.id),
+              usuarioId: Number(p.usuarioId),
+              nome: p?.usuario?.nome || null,
+              login: p?.usuario?.login || null,
+              papel: 'Veterinário',
+              tipo: p?.tipo?.tipo || null,
+              dataInicio: dataReferenciaParaStr(p.dataInicio),
+              dataFim: dataReferenciaParaStr(p.dataFim),
+            };
+          });
+        const afTec = afastamentosSobrepostos
+          .filter((af) => idsTec.includes(Number(af.usuarioId)))
+          .map((af) => {
+            const p = af.get ? af.get({ plain: true }) : af;
+            return {
+              afastamentoId: Number(p.id),
+              usuarioId: Number(p.usuarioId),
+              nome: p?.usuario?.nome || null,
+              login: p?.usuario?.login || null,
+              papel: 'Técnico',
+              tipo: p?.tipo?.tipo || null,
+              dataInicio: dataReferenciaParaStr(p.dataInicio),
+              dataFim: dataReferenciaParaStr(p.dataFim),
+            };
+          });
+
+        if (afVet.length > 0) {
+          await registrarEventoAuditoriaEscala({
+            escalaId: escala.id,
+            categoriaMembro: CATEGORIA_MEMBRO.VETERINARIO,
+            tipoEvento: 'afastamento_preexistente_na_criacao',
             referenciaTipo: 'escala',
             referenciaId: escala.id,
+            ordemAntesUsuarioIds: recalcCriacao.ordemInicialVet || ordemListaVet.map((m) => m.usuarioId),
+            ordemDepoisUsuarioIds: recalcCriacao.ordemAtualVet || ordemListaVet.map((m) => m.usuarioId),
+            detalhes: { afastamentos: afVet },
             criadoPorUsuarioId: criadoPorUsuarioId || null,
-          },
-        });
+            transaction: t,
+          });
+        }
+        if (afTec.length > 0) {
+          await registrarEventoAuditoriaEscala({
+            escalaId: escala.id,
+            categoriaMembro: CATEGORIA_MEMBRO.TECNICO,
+            tipoEvento: 'afastamento_preexistente_na_criacao',
+            referenciaTipo: 'escala',
+            referenciaId: escala.id,
+            ordemAntesUsuarioIds: recalcCriacao.ordemInicialTec || ordemListaTec.map((m) => m.usuarioId),
+            ordemDepoisUsuarioIds: recalcCriacao.ordemAtualTec || ordemListaTec.map((m) => m.usuarioId),
+            detalhes: { afastamentos: afTec },
+            criadoPorUsuarioId: criadoPorUsuarioId || null,
+            transaction: t,
+          });
+        }
       }
 
       return escala;
@@ -2351,6 +2423,7 @@ const EscalaService = {
           dataInicio: dataInicioStr,
           dataFim: dataFimStr,
           usuarioId,
+          tipoAfastamento: afastamentoPlain?.tipo?.tipo || null,
           servidorRelacionado: {
             usuarioId,
             nome: usuarioRefPlain?.nome || null,
@@ -2387,7 +2460,12 @@ const EscalaService = {
         tipoEvento: 'afastamento_inclusao',
         referenciaTipo: 'afastamento',
         referenciaId: Number(afastamento.id),
-        detalhes: { dataInicio: dataInicioStr, dataFim: dataFimStr, usuarioId: Number(afastamento.usuarioId) },
+        detalhes: {
+          dataInicio: dataInicioStr,
+          dataFim: dataFimStr,
+          usuarioId: Number(afastamento.usuarioId),
+          tipoAfastamento: afastamento?.tipo?.tipo || null,
+        },
         criadoPorUsuarioId,
         categoriaAlvo: escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO,
       },
