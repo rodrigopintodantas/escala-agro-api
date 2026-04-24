@@ -16,7 +16,7 @@ const ServidorService = {
     const rows = await UsuarioModel.findAll({
       include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papelVet.id } }],
       where: { ativo: true },
-      attributes: ['id', 'nome', 'login'],
+      attributes: ['id', 'nome', 'login', 'suspensoEscala'],
       order: [['nome', 'ASC']],
     });
     return rows.map((u) => u.get({ plain: true }));
@@ -29,6 +29,17 @@ const ServidorService = {
     }
 
     return await sequelizeTransaction(async (t) => {
+      const existeEscalaAtiva = await models.EscalaModel.findOne({
+        where: { status: 'ativa' },
+        attributes: ['id'],
+        transaction: t,
+      });
+      if (existeEscalaAtiva) {
+        throw new ApiBaseError(
+          'Há escala ativa no momento. Não é possível excluir servidor; utilize a ação de suspender servidor.',
+        );
+      }
+
       const papelVet = await PapelModel.findOne({
         where: { nome: { [Op.in]: PAPEIS_VETERINARIO } },
         transaction: t,
@@ -80,6 +91,82 @@ const ServidorService = {
       return {
         removido: true,
         recalcEscalas,
+      };
+    });
+  },
+
+  suspenderVeterinarioEmEscalasAtivas: async (usuarioIdRaw) => {
+    const usuarioId = Number(usuarioIdRaw);
+    if (!Number.isFinite(usuarioId) || usuarioId < 1) {
+      throw new ApiBaseError('Usuário inválido.');
+    }
+
+    return await sequelizeTransaction(async (t) => {
+      const usuario = await UsuarioModel.findByPk(usuarioId, { transaction: t });
+      if (!usuario) throw new ApiBaseError('Servidor não encontrado.');
+
+      const membrosAtivos = await models.EscalaMembroModel.findAll({
+        include: [
+          {
+            model: models.EscalaModel,
+            as: 'escala',
+            required: true,
+            where: { status: 'ativa' },
+            attributes: ['id'],
+          },
+        ],
+        where: { usuarioId, ativo: true },
+        attributes: ['escalaId'],
+        transaction: t,
+      });
+      const escalaIds = [...new Set(membrosAtivos.map((m) => Number(m.escalaId)).filter((id) => Number.isFinite(id) && id > 0))];
+      if (escalaIds.length === 0) {
+        return { suspenso: false, escalasAfetadas: 0, plantoesMarcados: 0 };
+      }
+
+      usuario.suspensoEscala = true;
+      await usuario.save({ transaction: t });
+
+      return {
+        suspenso: true,
+        escalasAfetadas: escalaIds.length,
+        plantoesMarcados: 0,
+      };
+    });
+  },
+
+  reativarVeterinarioEmEscalasAtivas: async (usuarioIdRaw) => {
+    const usuarioId = Number(usuarioIdRaw);
+    if (!Number.isFinite(usuarioId) || usuarioId < 1) {
+      throw new ApiBaseError('Usuário inválido.');
+    }
+
+    return await sequelizeTransaction(async (t) => {
+      const usuario = await UsuarioModel.findByPk(usuarioId, { transaction: t });
+      if (!usuario) throw new ApiBaseError('Servidor não encontrado.');
+
+      const membrosAtivos = await models.EscalaMembroModel.findAll({
+        include: [
+          {
+            model: models.EscalaModel,
+            as: 'escala',
+            required: true,
+            where: { status: 'ativa' },
+            attributes: ['id'],
+          },
+        ],
+        where: { usuarioId, ativo: true },
+        attributes: ['escalaId'],
+        transaction: t,
+      });
+      const escalaIds = [...new Set(membrosAtivos.map((m) => Number(m.escalaId)).filter((id) => Number.isFinite(id) && id > 0))];
+
+      usuario.suspensoEscala = false;
+      await usuario.save({ transaction: t });
+
+      return {
+        reativado: true,
+        escalasAfetadas: escalaIds.length,
       };
     });
   },

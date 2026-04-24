@@ -18,7 +18,27 @@ const excluirVeterinario = async (req, res, next) => {
   }
 };
 
+const suspenderVeterinario = async (req, res, next) => {
+  try {
+    const resultado = await ServidorService.suspenderVeterinarioEmEscalasAtivas(req.params.id);
+    res.status(200).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
+const reativarVeterinario = async (req, res, next) => {
+  try {
+    const resultado = await ServidorService.reativarVeterinarioEmEscalasAtivas(req.params.id);
+    res.status(200).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   listarVeterinarios,
   excluirVeterinario,
+  suspenderVeterinario,
+  reativarVeterinario,
 };

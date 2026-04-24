@@ -26,6 +26,12 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING,
         allowNull: true,
       },
+      suspensoEscala: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+        field: 'suspenso_escala',
+      },
     },
     { freezeTableName: true, tableName: 'usuario', timestamps: false },
   );

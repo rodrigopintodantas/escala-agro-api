@@ -877,7 +877,7 @@ async function recalcularEscalaInterno(
     },
     include: [
       { model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] },
-      { model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] },
+      { model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'suspensoEscala'] },
     ],
     transaction,
   });
@@ -1437,14 +1437,14 @@ const EscalaService = {
           as: 'plantaoOrigem',
           attributes: ['id', 'dataReferencia', 'usuarioId', 'observacao'],
           required: false,
-          include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
+          include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'suspensoEscala'] }],
         },
         {
           model: PlantaoModel,
           as: 'plantaoDestino',
           attributes: ['id', 'dataReferencia', 'usuarioId', 'observacao'],
           required: false,
-          include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
+          include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'suspensoEscala'] }],
         },
       ],
       order: [['createdAt', 'DESC']],
@@ -1547,7 +1547,7 @@ const EscalaService = {
             ['ordem', 'ASC'],
           ],
           attributes: ['id', 'ordem', 'usuarioId', 'ativo', 'categoriaMembro'],
-          include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
+          include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'suspensoEscala'] }],
         },
       ],
     }),
@@ -1578,7 +1578,7 @@ const EscalaService = {
           [Op.lte]: dataFimEscala,
         },
       },
-      include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
+      include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'suspensoEscala'] }],
       order: [
         ['dataReferencia', 'ASC'],
         [sequelize.literal("CASE WHEN categoria_plantao = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
