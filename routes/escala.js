@@ -10,6 +10,7 @@ const somenteAdmin = authorize([_ROLES.ADMIN]);
 router.get('/veterinarios', somenteAdmin, ctl.listarVeterinarios);
 router.get('/tecnicos', somenteAdmin, ctl.listarTecnicos);
 router.get('/ordem-servidores', somenteAdmin, ctl.listarOrdemServidores);
+router.get('/auditoria', somenteAdmin, ctl.listarAuditoria);
 router.put('/ordem-servidores', somenteAdmin, ctl.salvarOrdemServidores);
 router.get('/permutas', ctl.listarPermutas);
 router.post('/permutas/:permutaId/cancelar', ctl.cancelarPermuta);

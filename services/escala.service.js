@@ -14,6 +14,7 @@ const {
   TipoAfastamentoModel,
   OrdemServidorModel,
   EscalaOrdemHistoricoModel,
+  EscalaAuditoriaEventoModel,
 } = require('../models');
 const { sequelize } = require('../models');
 
@@ -654,12 +655,46 @@ async function buscarHistoricoOrdemParaAfastamento(escalaId, afastamentoId, cate
   return hist;
 }
 
+async function registrarEventoAuditoriaEscala({
+  escalaId,
+  categoriaMembro,
+  tipoEvento,
+  referenciaTipo = null,
+  referenciaId = null,
+  dataReferencia = null,
+  ordemAntesUsuarioIds = null,
+  ordemDepoisUsuarioIds = [],
+  detalhes = null,
+  criadoPorUsuarioId = null,
+  transaction,
+}) {
+  const ordemDepois = Array.isArray(ordemDepoisUsuarioIds) ? ordemDepoisUsuarioIds.map((x) => Number(x)).filter((x) => Number.isFinite(x)) : [];
+  const ordemAntes = Array.isArray(ordemAntesUsuarioIds) ? ordemAntesUsuarioIds.map((x) => Number(x)).filter((x) => Number.isFinite(x)) : null;
+  if (ordemDepois.length === 0) return;
+  await EscalaAuditoriaEventoModel.create(
+    {
+      escalaId: Number(escalaId),
+      categoriaMembro: String(categoriaMembro || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO,
+      tipoEvento: String(tipoEvento || 'recalculo'),
+      referenciaTipo: referenciaTipo || null,
+      referenciaId: Number.isFinite(Number(referenciaId)) ? Number(referenciaId) : null,
+      dataReferencia: dataReferencia ? dataReferenciaParaStr(dataReferencia) : null,
+      ordemAntesUsuarioIds: ordemAntes,
+      ordemDepoisUsuarioIds: ordemDepois,
+      detalhes: detalhes || null,
+      criadoPorUsuarioId: Number.isFinite(Number(criadoPorUsuarioId)) ? Number(criadoPorUsuarioId) : null,
+    },
+    { transaction },
+  );
+}
+
 async function recalcularEscalaInterno(
   escalaId,
   {
     transaction,
     historicoMotivo = null,
     historicoAfastamento = null,
+    auditoriaContexto = null,
     /**
      * Se true, não aplica bootstrap por snapshot do primeiro afastamento; em vez disso, inicia
      * `ordemAtual` e `ordemGlobal` a partir do histórico `motivo: 'inicial'` da escala (criação).
@@ -1088,6 +1123,54 @@ async function recalcularEscalaInterno(
 
   const ordemGlobalMudou = ordemGlobalMudouVet || ordemGlobalMudouTec;
 
+  const categoriaAlvo =
+    String(auditoriaContexto?.categoriaAlvo || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO
+      ? CATEGORIA_MEMBRO.TECNICO
+      : String(auditoriaContexto?.categoriaAlvo || '').toLowerCase() === CATEGORIA_MEMBRO.VETERINARIO
+        ? CATEGORIA_MEMBRO.VETERINARIO
+        : null;
+  const registrarVet =
+    ordemMudouVet ||
+    (auditoriaContexto?.registrarMesmoSemMudanca === true &&
+      categoriaAlvo === CATEGORIA_MEMBRO.VETERINARIO &&
+      ordemAtualDbInicialVet.length > 0);
+  const registrarTec =
+    ordemMudouTec ||
+    (auditoriaContexto?.registrarMesmoSemMudanca === true &&
+      categoriaAlvo === CATEGORIA_MEMBRO.TECNICO &&
+      ordemAtualDbInicialTec.length > 0);
+
+  if (registrarVet) {
+    await registrarEventoAuditoriaEscala({
+      escalaId,
+      categoriaMembro: CATEGORIA_MEMBRO.VETERINARIO,
+      tipoEvento: auditoriaContexto?.tipoEvento || 'recalculo_ordem',
+      referenciaTipo: auditoriaContexto?.referenciaTipo || null,
+      referenciaId: auditoriaContexto?.referenciaId || null,
+      dataReferencia: auditoriaContexto?.dataReferencia || null,
+      ordemAntesUsuarioIds: ordemAtualDbInicialVet,
+      ordemDepoisUsuarioIds: ordemAtualVet,
+      detalhes: auditoriaContexto?.detalhes || { historicoMotivo },
+      criadoPorUsuarioId: auditoriaContexto?.criadoPorUsuarioId || null,
+      transaction,
+    });
+  }
+  if (registrarTec) {
+    await registrarEventoAuditoriaEscala({
+      escalaId,
+      categoriaMembro: CATEGORIA_MEMBRO.TECNICO,
+      tipoEvento: auditoriaContexto?.tipoEvento || 'recalculo_ordem',
+      referenciaTipo: auditoriaContexto?.referenciaTipo || null,
+      referenciaId: auditoriaContexto?.referenciaId || null,
+      dataReferencia: auditoriaContexto?.dataReferencia || null,
+      ordemAntesUsuarioIds: ordemAtualDbInicialTec,
+      ordemDepoisUsuarioIds: ordemAtualTec,
+      detalhes: auditoriaContexto?.detalhes || { historicoMotivo },
+      criadoPorUsuarioId: auditoriaContexto?.criadoPorUsuarioId || null,
+      transaction,
+    });
+  }
+
   return {
     atualizados,
     ordemMudou,
@@ -1247,7 +1330,7 @@ async function recalcularEscalasPorUsuarioPeriodoInterno(
   usuarioId,
   dataInicioStr,
   dataFimStr,
-  { transactionExterna = null, historicoMotivo = 'recalculo', historicoAfastamento = null } = {},
+  { transactionExterna = null, historicoMotivo = 'recalculo', historicoAfastamento = null, auditoriaContexto = null } = {},
 ) {
   const membros = await EscalaMembroModel.findAll({
     where: { usuarioId, ativo: true },
@@ -1286,6 +1369,7 @@ async function recalcularEscalasPorUsuarioPeriodoInterno(
         transaction: transactionExterna,
         historicoMotivo,
         historicoAfastamento,
+        auditoriaContexto,
       });
       plantoesAtualizados += recalc.atualizados;
       if (recalc.ordemMudou) ordensAlteradas += 1;
@@ -1302,6 +1386,7 @@ async function recalcularEscalasPorUsuarioPeriodoInterno(
         transaction: t,
         historicoMotivo,
         historicoAfastamento,
+        auditoriaContexto,
       });
       plantoesAtualizados += recalc.atualizados;
       if (recalc.ordemMudou) ordensAlteradas += 1;
@@ -1736,6 +1821,123 @@ const EscalaService = {
       });
   },
 
+  listarAuditoriaEscalasAbertas: async (categoriaParam = CATEGORIA_MEMBRO.VETERINARIO) => {
+    const categoria =
+      String(categoriaParam || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
+
+    const escalas = await EscalaModel.findAll({
+      where: { status: 'ativa' },
+      attributes: ['id', 'nome', 'dataInicio', 'dataFim', 'status'],
+      order: [['dataInicio', 'ASC']],
+    });
+    if (escalas.length === 0) return [];
+
+    const escalaIds = escalas.map((e) => Number(e.id));
+    const eventos = await EscalaAuditoriaEventoModel.findAll({
+      where: { escalaId: { [Op.in]: escalaIds }, categoriaMembro: categoria },
+      order: [['createdAt', 'ASC'], ['id', 'ASC']],
+    });
+
+    const afastamentoRefIds = [
+      ...new Set(
+        eventos
+          .filter((e) => String(e.referenciaTipo || '') === 'afastamento' && Number.isFinite(Number(e.referenciaId)))
+          .map((e) => Number(e.referenciaId)),
+      ),
+    ];
+    const afastamentosRef =
+      afastamentoRefIds.length > 0
+        ? await AfastamentoModel.findAll({
+            where: { id: { [Op.in]: afastamentoRefIds } },
+            include: [{ model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login'] }],
+            attributes: ['id', 'usuarioId'],
+          })
+        : [];
+    const afastamentoServidorMap = new Map(
+      afastamentosRef.map((a) => {
+        const ap = a.get ? a.get({ plain: true }) : a;
+        return [
+          Number(ap.id),
+          {
+            usuarioId: Number(ap.usuarioId),
+            nome: ap?.usuario?.nome || null,
+            login: ap?.usuario?.login || null,
+          },
+        ];
+      }),
+    );
+
+    const idsUsuarios = new Set();
+    for (const ev of eventos) {
+      const antes = Array.isArray(ev.ordemAntesUsuarioIds) ? ev.ordemAntesUsuarioIds : [];
+      const depois = Array.isArray(ev.ordemDepoisUsuarioIds) ? ev.ordemDepoisUsuarioIds : [];
+      for (const id of [...antes, ...depois]) {
+        const n = Number(id);
+        if (Number.isFinite(n) && n > 0) idsUsuarios.add(n);
+      }
+    }
+    const rowsUsuarios =
+      idsUsuarios.size > 0
+        ? await UsuarioModel.findAll({
+            where: { id: { [Op.in]: [...idsUsuarios] } },
+            attributes: ['id', 'nome', 'login'],
+          })
+        : [];
+    const usuarioMap = new Map(rowsUsuarios.map((u) => [Number(u.id), u.get({ plain: true })]));
+
+    const nomeOrdem = (arr) =>
+      (Array.isArray(arr) ? arr : []).map((id) => {
+        const uid = Number(id);
+        const u = usuarioMap.get(uid);
+        return { usuarioId: uid, nome: u?.nome || null, login: u?.login || null };
+      });
+
+    const eventosPorEscala = new Map();
+    for (const evRow of eventos) {
+      const ev = evRow.get ? evRow.get({ plain: true }) : evRow;
+      const detalhesBase = ev.detalhes && typeof ev.detalhes === 'object' ? { ...ev.detalhes } : {};
+      const refAfast = String(ev.referenciaTipo || '') === 'afastamento' ? afastamentoServidorMap.get(Number(ev.referenciaId)) : null;
+      if (refAfast) {
+        detalhesBase.servidorRelacionado = {
+          usuarioId: refAfast.usuarioId,
+          nome: refAfast.nome,
+          login: refAfast.login,
+          papel: String(ev.categoriaMembro || '') === CATEGORIA_MEMBRO.TECNICO ? 'Técnico' : 'Veterinário',
+        };
+      } else if (detalhesBase?.servidorRelacionado && !detalhesBase.servidorRelacionado.papel) {
+        detalhesBase.servidorRelacionado.papel =
+          String(ev.categoriaMembro || '') === CATEGORIA_MEMBRO.TECNICO ? 'Técnico' : 'Veterinário';
+      }
+      const arr = eventosPorEscala.get(Number(ev.escalaId)) || [];
+      arr.push({
+        id: Number(ev.id),
+        categoriaMembro: ev.categoriaMembro,
+        tipoEvento: ev.tipoEvento,
+        referenciaTipo: ev.referenciaTipo || null,
+        referenciaId: ev.referenciaId != null ? Number(ev.referenciaId) : null,
+        dataReferencia: ev.dataReferencia || null,
+        detalhes: detalhesBase,
+        createdAt: ev.createdAt,
+        ordemAntes: nomeOrdem(ev.ordemAntesUsuarioIds),
+        ordemDepois: nomeOrdem(ev.ordemDepoisUsuarioIds),
+      });
+      eventosPorEscala.set(Number(ev.escalaId), arr);
+    }
+
+    return escalas.map((eRow) => {
+      const e = eRow.get ? eRow.get({ plain: true }) : eRow;
+      return {
+        escalaId: Number(e.id),
+        nome: e.nome,
+        dataInicio: dataReferenciaParaStr(e.dataInicio),
+        dataFim: dataReferenciaParaStr(e.dataFim),
+        status: e.status,
+        categoriaMembro: categoria,
+        eventos: eventosPorEscala.get(Number(e.id)) || [],
+      };
+    });
+  },
+
   salvarOrdemServidores: async (usuarioIds, escopoParam = ESCOPO_ORDEM.VETERINARIO) => {
     const escopo =
       String(escopoParam || '').toLowerCase() === ESCOPO_ORDEM.TECNICO ? ESCOPO_ORDEM.TECNICO : ESCOPO_ORDEM.VETERINARIO;
@@ -1952,6 +2154,15 @@ const EscalaService = {
         categoriaOrdem: CATEGORIA_MEMBRO.VETERINARIO,
         transaction: t,
       });
+      await registrarEventoAuditoriaEscala({
+        escalaId: escala.id,
+        categoriaMembro: CATEGORIA_MEMBRO.VETERINARIO,
+        tipoEvento: 'ordem_inicial',
+        ordemDepoisUsuarioIds: ordemListaVet.map((m) => m.usuarioId),
+        detalhes: { origem: 'criacao_escala' },
+        criadoPorUsuarioId: criadoPorUsuarioId || null,
+        transaction: t,
+      });
       await registrarHistoricoOrdem({
         escalaId: escala.id,
         ordemUsuarioIds: ordemListaTec.map((m) => m.usuarioId),
@@ -1960,11 +2171,26 @@ const EscalaService = {
         categoriaOrdem: CATEGORIA_MEMBRO.TECNICO,
         transaction: t,
       });
+      await registrarEventoAuditoriaEscala({
+        escalaId: escala.id,
+        categoriaMembro: CATEGORIA_MEMBRO.TECNICO,
+        tipoEvento: 'ordem_inicial',
+        ordemDepoisUsuarioIds: ordemListaTec.map((m) => m.usuarioId),
+        detalhes: { origem: 'criacao_escala' },
+        criadoPorUsuarioId: criadoPorUsuarioId || null,
+        transaction: t,
+      });
 
       if (datas.length > 0) {
         await recalcularEscalaInterno(escala.id, {
           transaction: t,
           historicoMotivo: 'recalculo',
+          auditoriaContexto: {
+            tipoEvento: 'recalculo_criacao',
+            referenciaTipo: 'escala',
+            referenciaId: escala.id,
+            criadoPorUsuarioId: criadoPorUsuarioId || null,
+          },
         });
       }
 
@@ -1972,7 +2198,7 @@ const EscalaService = {
     });
   },
 
-  adicionarDatasPlantaoExtras: async (escalaId, datasPlantaoExtras) => {
+  adicionarDatasPlantaoExtras: async (escalaId, datasPlantaoExtras, criadoPorUsuarioId = null) => {
     const escala = await EscalaModel.findByPk(escalaId);
     if (!escala) throw new ApiBaseError('Escala não encontrada.');
 
@@ -2060,6 +2286,13 @@ const EscalaService = {
         transaction: t,
         historicoMotivo: 'manual',
         skipBootstrap: true,
+        auditoriaContexto: {
+          tipoEvento: 'feriado_inclusao',
+          referenciaTipo: 'escala',
+          referenciaId: escalaId,
+          detalhes: { datas: novas },
+          criadoPorUsuarioId,
+        },
       });
       const permutasCanceladas = await cancelarPermutasPendentesEscala(escalaId, t);
       return {
@@ -2087,11 +2320,18 @@ const EscalaService = {
   /**
    * Restaura ordem na escala e ordem geral a partir dos snapshots, remove o afastamento e recalcula as escalas.
    */
-  desfazerAfastamentoRecalculo: async (afastamentoPlain, transaction) => {
+  desfazerAfastamentoRecalculo: async (afastamentoPlain, transaction, criadoPorUsuarioId = null) => {
     const id = Number(afastamentoPlain.id);
     const usuarioId = Number(afastamentoPlain.usuarioId);
     const dataInicioStr = dataReferenciaParaStr(afastamentoPlain.dataInicio);
     const dataFimStr = dataReferenciaParaStr(afastamentoPlain.dataFim);
+    const usuarioRef = await UsuarioModel.findByPk(usuarioId, {
+      attributes: ['id', 'nome', 'login'],
+      transaction,
+    });
+    const usuarioRefPlain = usuarioRef && usuarioRef.get ? usuarioRef.get({ plain: true }) : null;
+    const escopoAf = await escopoOrdemGlobalParaUsuarioId(usuarioId, transaction);
+    const categoriaAlvo = escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
 
     await restaurarOrdemEGlobalAntesDesfazerAfastamento(afastamentoPlain, transaction);
 
@@ -2103,11 +2343,31 @@ const EscalaService = {
       transactionExterna: transaction,
       historicoMotivo: 'apos_desfazer_afastamento',
       historicoAfastamento: null,
+      auditoriaContexto: {
+        tipoEvento: 'afastamento_exclusao',
+        referenciaTipo: 'afastamento',
+        referenciaId: id,
+        detalhes: {
+          dataInicio: dataInicioStr,
+          dataFim: dataFimStr,
+          usuarioId,
+          servidorRelacionado: {
+            usuarioId,
+            nome: usuarioRefPlain?.nome || null,
+            login: usuarioRefPlain?.login || null,
+            papel: categoriaAlvo === CATEGORIA_MEMBRO.TECNICO ? 'Técnico' : 'Veterinário',
+          },
+        },
+        criadoPorUsuarioId,
+        registrarMesmoSemMudanca: true,
+        categoriaAlvo,
+      },
     });
   },
 
   recalcularEscalasPorAfastamento: async (afastamentoId, options = {}) => {
     const transactionExterna = options.transaction || null;
+    const criadoPorUsuarioId = options.criadoPorUsuarioId || null;
     const afastamento = await AfastamentoModel.findByPk(afastamentoId, {
       include: [{ model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] }],
       transaction: transactionExterna || undefined,
@@ -2123,6 +2383,14 @@ const EscalaService = {
       transactionExterna,
       historicoMotivo: 'afastamento',
       historicoAfastamento: afastamento,
+      auditoriaContexto: {
+        tipoEvento: 'afastamento_inclusao',
+        referenciaTipo: 'afastamento',
+        referenciaId: Number(afastamento.id),
+        detalhes: { dataInicio: dataInicioStr, dataFim: dataFimStr, usuarioId: Number(afastamento.usuarioId) },
+        criadoPorUsuarioId,
+        categoriaAlvo: escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO,
+      },
     });
 
     /** Sempre persiste o snapshot "antes do recálculo" (usado no bootstrap ao desfazer outro afastamento). */
@@ -2177,7 +2445,7 @@ const EscalaService = {
     return row.get({ plain: true });
   },
 
-  removerPlantoesFeriadosFacultativos: async (escalaId, plantaoIdsRaw) => {
+  removerPlantoesFeriadosFacultativos: async (escalaId, plantaoIdsRaw, criadoPorUsuarioId = null) => {
     const ids = Array.isArray(plantaoIdsRaw)
       ? [...new Set(plantaoIdsRaw.map((x) => parseInt(x, 10)).filter((x) => Number.isFinite(x) && x > 0))]
       : [];
@@ -2217,6 +2485,13 @@ const EscalaService = {
         transaction: t,
         historicoMotivo: 'manual',
         skipBootstrap: true,
+        auditoriaContexto: {
+          tipoEvento: 'feriado_exclusao',
+          referenciaTipo: 'escala',
+          referenciaId: escalaId,
+          detalhes: { plantaoIds: ids },
+          criadoPorUsuarioId,
+        },
       });
       const permutasCanceladas = await cancelarPermutasPendentesEscala(escalaId, t);
 

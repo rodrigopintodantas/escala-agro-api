@@ -32,6 +32,7 @@ module.exports = (sequelize, DataTypes) => {
     });
     EscalaModel.hasMany(models.EscalaMembroModel, { foreignKey: 'escalaId', as: 'membros' });
     EscalaModel.hasMany(models.EscalaOrdemHistoricoModel, { foreignKey: 'escalaId', as: 'historicoOrdem' });
+    EscalaModel.hasMany(models.EscalaAuditoriaEventoModel, { foreignKey: 'escalaId', as: 'auditoriaEventos' });
     EscalaModel.hasMany(models.PlantaoModel, { foreignKey: 'escalaId', as: 'plantoes' });
     EscalaModel.hasMany(models.ImpedimentoModel, { foreignKey: 'escalaId', as: 'impedimentos' });
     EscalaModel.hasMany(models.PermutaSolicitacaoModel, { foreignKey: 'escalaId', as: 'permutas' });

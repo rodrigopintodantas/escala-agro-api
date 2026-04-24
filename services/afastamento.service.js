@@ -89,7 +89,10 @@ const AfastamentoService = {
         { transaction: t },
       );
 
-      const recalc = await EscalaService.recalcularEscalasPorAfastamento(created.id, { transaction: t });
+      const recalc = await EscalaService.recalcularEscalasPorAfastamento(created.id, {
+        transaction: t,
+        criadoPorUsuarioId: usuarioIdLogado,
+      });
 
       const full = await AfastamentoModel.findByPk(created.id, {
         include: includePadrao,
@@ -125,7 +128,7 @@ const AfastamentoService = {
       }
 
       const plain = row.get({ plain: true });
-      const recalc = await EscalaService.desfazerAfastamentoRecalculo(plain, t);
+      const recalc = await EscalaService.desfazerAfastamentoRecalculo(plain, t, usuarioIdLogado);
       return { removido: true, recalc };
     });
   },

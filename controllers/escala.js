@@ -52,6 +52,17 @@ const listarOrdemServidores = async (req, res, next) => {
   }
 };
 
+const listarAuditoria = async (req, res, next) => {
+  try {
+    const categoria =
+      req.query && String(req.query.categoria || '').toLowerCase() === 'tecnico' ? 'tecnico' : 'veterinario';
+    const lista = await EscalaService.listarAuditoriaEscalasAbertas(categoria);
+    res.status(200).json(lista);
+  } catch (err) {
+    next(err);
+  }
+};
+
 const salvarOrdemServidores = async (req, res, next) => {
   try {
     const usuarioIds = req.body && Array.isArray(req.body.usuarioIds) ? req.body.usuarioIds : [];
@@ -133,7 +144,8 @@ const adicionarDatasPlantaoExtras = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id, 10);
     const { datasPlantaoExtras } = req.body || {};
-    const resultado = await EscalaService.adicionarDatasPlantaoExtras(id, datasPlantaoExtras);
+    const criadoPorUsuarioId = req.auth && req.auth.UsuarioId ? req.auth.UsuarioId : null;
+    const resultado = await EscalaService.adicionarDatasPlantaoExtras(id, datasPlantaoExtras, criadoPorUsuarioId);
     res.status(200).json(resultado);
   } catch (err) {
     next(err);
@@ -144,7 +156,8 @@ const removerPlantoesFeriados = async (req, res, next) => {
   try {
     const id = parseInt(req.params.id, 10);
     const { plantaoIds } = req.body || {};
-    const resultado = await EscalaService.removerPlantoesFeriadosFacultativos(id, plantaoIds);
+    const criadoPorUsuarioId = req.auth && req.auth.UsuarioId ? req.auth.UsuarioId : null;
+    const resultado = await EscalaService.removerPlantoesFeriadosFacultativos(id, plantaoIds, criadoPorUsuarioId);
     res.status(200).json(resultado);
   } catch (err) {
     next(err);
@@ -209,6 +222,7 @@ module.exports = {
   listarVeterinarios,
   listarTecnicos,
   listarOrdemServidores,
+  listarAuditoria,
   salvarOrdemServidores,
   consultar,
   preverProximosPlantoes,
