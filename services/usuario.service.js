@@ -1,6 +1,15 @@
 const { Op } = require('sequelize');
 const sequelizeTransaction = require('../auth/sequelize-transaction');
 const { UsuarioModel, PapelModel, UsuarioPapelModel } = require('../models');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const ApiBaseError = require('../auth/base-error');
+
+const AUTH_JWT_EXPIRES_IN = process.env.AUTH_JWT_EXPIRES_IN || '8h';
+
+function getJwtSecret() {
+  return process.env.AUTH_JWT_SECRET || 'escala-agro-dev-secret';
+}
 
 const UsuarioService = {
   consultaPeloId: async (usuarioId) => {
@@ -9,6 +18,32 @@ const UsuarioService = {
 
   consultaPeloLogin: async (login) => {
     return await UsuarioModel.findOne({ where: { login } });
+  },
+
+  autenticar: async (login, senha) => {
+    const usuario = await UsuarioModel.findOne({
+      where: { login },
+      attributes: ['id', 'login', 'ativo', 'senhaHash'],
+    });
+    if (!usuario) {
+      throw new ApiBaseError('Login ou senha inválidos.');
+    }
+    if (!usuario.ativo) {
+      throw new ApiBaseError('O usuário está bloqueado no sistema.');
+    }
+    const ok = await bcrypt.compare(senha, usuario.senhaHash || '');
+    if (!ok) {
+      throw new ApiBaseError('Login ou senha inválidos.');
+    }
+    const token = jwt.sign(
+      {
+        login: usuario.login,
+        usuarioId: usuario.id,
+      },
+      getJwtSecret(),
+      { expiresIn: AUTH_JWT_EXPIRES_IN },
+    );
+    return { token };
   },
 
   listar: async () => {
@@ -72,6 +107,7 @@ const UsuarioService = {
           telefone: objetoReq.telefone,
           genero: objetoReq.genero,
           login: objetoReq.login,
+          senhaHash: await bcrypt.hash(String(objetoReq.senha || '123456'), 10),
           ativo: true,
           documento: objetoReq.documento || null,
         },
@@ -106,6 +142,7 @@ const UsuarioService = {
           telefone: objetoReq.telefone,
           genero: objetoReq.genero,
           login: objetoReq.login,
+          senhaHash: await bcrypt.hash(String(objetoReq.senha || '123456'), 10),
           ativo: true,
           documento: objetoReq.documento || null,
         },
@@ -147,6 +184,7 @@ const UsuarioService = {
           telefone: objetoReq.telefone,
           genero: objetoReq.genero,
           login: objetoReq.login,
+          ...(objetoReq.senha ? { senhaHash: await bcrypt.hash(String(objetoReq.senha), 10) } : {}),
           ativo: objetoReq.ativo,
           documento: objetoReq.documento || null,
         },

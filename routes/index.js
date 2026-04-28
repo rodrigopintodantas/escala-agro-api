@@ -7,6 +7,7 @@ const perfil = require('../auth/perfil');
 const _ROLES = require('../auth/role');
 
 const VERSAO = '0.1.0';
+const authCtl = require('../controllers/autenticacao');
 
 router.get('/status', function (req, res) {
   res.send({
@@ -18,6 +19,7 @@ router.get('/', function (req, res) {
   res.send({ msg: 'escala-agro - API' });
 });
 
+router.post('/auth/login', authCtl.login);
 router.get('/auth', authorizeSemPerfilSelecionado(), perfil);
 router.use('/usuario', require('./usuario'));
 router.use('/papel', authorize([_ROLES.ADMIN]), require('./papel'));

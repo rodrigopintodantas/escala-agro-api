@@ -1,12 +1,7 @@
 const { UsuarioPapelModel, PapelModel, UsuarioModel } = require('../models');
+const jwt = require('jsonwebtoken');
 
-/**
- * Autenticação simples sem SSO:
- * - Lê o login do usuário do header Authorization.
- * - Formato recomendado: "Authorization: Bearer login_do_usuario"
- * - Também aceita apenas o valor do login (sem Bearer) como fallback.
- */
-function getLoginFromRequest(req) {
+function getTokenFromRequest(req) {
   const authHeader = req.headers['authorization'];
   if (!authHeader) {
     return null;
@@ -17,7 +12,21 @@ function getLoginFromRequest(req) {
     return parts[1];
   }
 
-  return authHeader;
+  return null;
+}
+
+function getJwtSecret() {
+  return process.env.AUTH_JWT_SECRET || 'escala-agro-dev-secret';
+}
+
+function getAuthPayloadFromRequest(req) {
+  const token = getTokenFromRequest(req);
+  if (!token) return null;
+  try {
+    return jwt.verify(token, getJwtSecret());
+  } catch (_) {
+    return null;
+  }
 }
 
 function temPermissao(userRoles = [], functionRoles = []) {
@@ -34,11 +43,11 @@ function authorize(functionRoles = []) {
 
   return async (req, res, next) => {
     try {
-      const login = getLoginFromRequest(req);
-
-      if (!login) {
-        return res.status(401).json({ message: 'Cabeçalho Authorization não informado.' });
+      const authPayload = getAuthPayloadFromRequest(req);
+      if (!authPayload || !authPayload.login) {
+        return res.status(401).json({ message: 'Token de autenticação inválido ou ausente.' });
       }
+      const login = String(authPayload.login);
 
       const usuario = await getUsuario(login);
       if (!usuario) {
@@ -102,11 +111,11 @@ function authorize(functionRoles = []) {
 function authorizeSemPerfilSelecionado() {
   return async (req, res) => {
     try {
-      const login = getLoginFromRequest(req);
-
-      if (!login) {
-        return res.status(401).json({ message: 'Cabeçalho Authorization não informado.' });
+      const authPayload = getAuthPayloadFromRequest(req);
+      if (!authPayload || !authPayload.login) {
+        return res.status(401).json({ message: 'Token de autenticação inválido ou ausente.' });
       }
+      const login = String(authPayload.login);
 
       const usuario = await getUsuario(login);
       if (!usuario) {

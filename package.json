@@ -15,6 +15,7 @@
     "test": "NODE_ENV=test jest"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "body-parser": "2.1.0",
     "cookie-parser": "~1.4.4",
     "cors": "^2.8.5",
@@ -24,6 +25,7 @@
     "express-async-handler": "^1.2.0",
     "express-validator": "^7.2.1",
     "http-errors": "^2.0.0",
+    "jsonwebtoken": "^9.0.3",
     "morgan": "1.10.0",
     "pg": "^8.16.3",
     "pg-hstore": "^2.3.4",

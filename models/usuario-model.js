@@ -18,6 +18,11 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
       login: { type: DataTypes.STRING, unique: 'login' },
+      senhaHash: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        field: 'senha_hash',
+      },
       ativo: DataTypes.BOOLEAN,
       email: DataTypes.STRING,
       genero: DataTypes.STRING,
