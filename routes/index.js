@@ -26,5 +26,6 @@ router.use('/papel', authorize([_ROLES.ADMIN]), require('./papel'));
 router.use('/escala', authorize([_ROLES.ADMIN, _ROLES.VT]), require('./escala'));
 router.use('/afastamento', authorize([_ROLES.ADMIN, _ROLES.VT]), require('./afastamento'));
 router.use('/servidor', authorize([_ROLES.ADMIN]), require('./servidor'));
+router.use('/sistema', authorize([_ROLES.ADMIN]), require('./sistema'));
 
 module.exports = router;
