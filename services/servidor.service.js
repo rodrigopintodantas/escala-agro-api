@@ -6,23 +6,58 @@ const EscalaService = require('./escala.service');
 const { UsuarioModel, UsuarioPapelModel, PapelModel, OrdemServidorModel } = models;
 
 const PAPEIS_VETERINARIO = ['Veterinario', 'Veterinário'];
+const PAPEIS_TECNICO = ['Tecnico', 'Técnico'];
 const ESCOPO_ORDEM_VETERINARIO = 'veterinario';
+const ESCOPO_ORDEM_TECNICO = 'tecnico';
+
+function normalizarEscopo(escopoRaw) {
+  return String(escopoRaw || '').toLowerCase() === ESCOPO_ORDEM_TECNICO ? ESCOPO_ORDEM_TECNICO : ESCOPO_ORDEM_VETERINARIO;
+}
+
+function configEscopo(escopo) {
+  if (escopo === ESCOPO_ORDEM_TECNICO) {
+    return {
+      papeis: PAPEIS_TECNICO,
+      escopoOrdem: ESCOPO_ORDEM_TECNICO,
+      rotuloPapel: 'técnico',
+      rotuloPapelTitulo: 'Técnico',
+    };
+  }
+  return {
+    papeis: PAPEIS_VETERINARIO,
+    escopoOrdem: ESCOPO_ORDEM_VETERINARIO,
+    rotuloPapel: 'veterinário',
+    rotuloPapelTitulo: 'Veterinário',
+  };
+}
+
+async function listarPorEscopo(escopoRaw) {
+  const escopo = normalizarEscopo(escopoRaw);
+  const cfg = configEscopo(escopo);
+  const papel = await PapelModel.findOne({ where: { nome: { [Op.in]: cfg.papeis } } });
+  if (!papel) return [];
+
+  const rows = await UsuarioModel.findAll({
+    include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papel.id } }],
+    where: { ativo: true },
+    attributes: ['id', 'nome', 'login', 'suspensoEscala'],
+    order: [['nome', 'ASC']],
+  });
+  return rows.map((u) => u.get({ plain: true }));
+}
 
 const ServidorService = {
-  listarVeterinarios: async () => {
-    const papelVet = await PapelModel.findOne({ where: { nome: { [Op.in]: PAPEIS_VETERINARIO } } });
-    if (!papelVet) return [];
+  listarVeterinarios: async () => listarPorEscopo(ESCOPO_ORDEM_VETERINARIO),
 
-    const rows = await UsuarioModel.findAll({
-      include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papelVet.id } }],
-      where: { ativo: true },
-      attributes: ['id', 'nome', 'login', 'suspensoEscala'],
-      order: [['nome', 'ASC']],
-    });
-    return rows.map((u) => u.get({ plain: true }));
-  },
+  listarTecnicos: async () => listarPorEscopo(ESCOPO_ORDEM_TECNICO),
 
-  excluirVeterinario: async (usuarioIdRaw) => {
+  excluirVeterinario: async (usuarioIdRaw) => ServidorService.excluirServidor(usuarioIdRaw, ESCOPO_ORDEM_VETERINARIO),
+
+  excluirTecnico: async (usuarioIdRaw) => ServidorService.excluirServidor(usuarioIdRaw, ESCOPO_ORDEM_TECNICO),
+
+  excluirServidor: async (usuarioIdRaw, escopoRaw) => {
+    const escopo = normalizarEscopo(escopoRaw);
+    const cfg = configEscopo(escopo);
     const usuarioId = Number(usuarioIdRaw);
     if (!Number.isFinite(usuarioId) || usuarioId < 1) {
       throw new ApiBaseError('Usuário inválido.');
@@ -40,48 +75,48 @@ const ServidorService = {
         );
       }
 
-      const papelVet = await PapelModel.findOne({
-        where: { nome: { [Op.in]: PAPEIS_VETERINARIO } },
+      const papel = await PapelModel.findOne({
+        where: { nome: { [Op.in]: cfg.papeis } },
         transaction: t,
       });
-      if (!papelVet) throw new ApiBaseError('Papel de veterinário não encontrado.');
+      if (!papel) throw new ApiBaseError(`Papel de ${cfg.rotuloPapel} não encontrado.`);
 
       const usuario = await UsuarioModel.findByPk(usuarioId, { transaction: t });
-      if (!usuario) throw new ApiBaseError('Veterinário não encontrado.');
+      if (!usuario) throw new ApiBaseError(`${cfg.rotuloPapelTitulo} não encontrado.`);
 
-      const vinculoVet = await UsuarioPapelModel.findOne({
-        where: { UsuarioModelId: usuarioId, PapelModelId: papelVet.id },
+      const vinculo = await UsuarioPapelModel.findOne({
+        where: { UsuarioModelId: usuarioId, PapelModelId: papel.id },
         transaction: t,
       });
-      if (!vinculoVet) {
-        throw new ApiBaseError('O usuário informado não está vinculado ao papel de veterinário.');
+      if (!vinculo) {
+        throw new ApiBaseError(`O usuário informado não está vinculado ao papel de ${cfg.rotuloPapel}.`);
       }
 
       const recalcEscalas = await EscalaService.removerUsuarioDasEscalasAtivas(usuarioId, t);
 
-      await OrdemServidorModel.destroy({ where: { usuarioId, escopo: ESCOPO_ORDEM_VETERINARIO }, transaction: t });
+      await OrdemServidorModel.destroy({ where: { usuarioId, escopo: cfg.escopoOrdem }, transaction: t });
       const ordemRestante = await OrdemServidorModel.findAll({
-        where: { escopo: ESCOPO_ORDEM_VETERINARIO },
+        where: { escopo: cfg.escopoOrdem },
         order: [['ordem', 'ASC']],
         transaction: t,
       });
       const idsRestantes = ordemRestante
         .map((r) => Number(r.usuarioId))
         .filter((id) => Number.isFinite(id) && id > 0 && id !== usuarioId);
-      await OrdemServidorModel.destroy({ where: { escopo: ESCOPO_ORDEM_VETERINARIO }, transaction: t });
+      await OrdemServidorModel.destroy({ where: { escopo: cfg.escopoOrdem }, transaction: t });
       if (idsRestantes.length > 0) {
         await OrdemServidorModel.bulkCreate(
           idsRestantes.map((id, idx) => ({
             usuarioId: id,
             ordem: idx + 1,
-            escopo: ESCOPO_ORDEM_VETERINARIO,
+            escopo: cfg.escopoOrdem,
           })),
           { transaction: t },
         );
       }
 
       await UsuarioPapelModel.destroy({
-        where: { UsuarioModelId: usuarioId, PapelModelId: papelVet.id },
+        where: { UsuarioModelId: usuarioId, PapelModelId: papel.id },
         transaction: t,
       });
 

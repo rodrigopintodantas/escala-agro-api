@@ -46,6 +46,25 @@ const UsuarioService = {
     return { token };
   },
 
+  alterarSenha: async (usuarioId, senhaAtual, senhaNova) => {
+    const usuario = await UsuarioModel.findByPk(usuarioId, {
+      attributes: ['id', 'senhaHash', 'ativo'],
+    });
+    if (!usuario || !usuario.senhaHash) {
+      throw new ApiBaseError('Usuário não encontrado.');
+    }
+    if (!usuario.ativo) {
+      throw new ApiBaseError('O usuário está bloqueado no sistema.');
+    }
+    const ok = await bcrypt.compare(senhaAtual, usuario.senhaHash);
+    if (!ok) {
+      throw new ApiBaseError('Senha atual incorreta.');
+    }
+    const novoHash = await bcrypt.hash(senhaNova, 10);
+    await usuario.update({ senhaHash: novoHash });
+    return { ok: true };
+  },
+
   listar: async () => {
     return await UsuarioModel.findAll({
       include: [

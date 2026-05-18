@@ -7,4 +7,9 @@ router.post('/veterinarios/:id/suspender', ctl.suspenderVeterinario);
 router.post('/veterinarios/:id/reativar', ctl.reativarVeterinario);
 router.delete('/veterinarios/:id', ctl.excluirVeterinario);
 
+router.get('/tecnicos', ctl.listarTecnicos);
+router.post('/tecnicos/:id/suspender', ctl.suspenderVeterinario);
+router.post('/tecnicos/:id/reativar', ctl.reativarVeterinario);
+router.delete('/tecnicos/:id', ctl.excluirTecnico);
+
 module.exports = router;

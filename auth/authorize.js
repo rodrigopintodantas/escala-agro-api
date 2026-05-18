@@ -202,7 +202,35 @@ async function getPapelUsuario(usuario) {
   });
 }
 
+function authBearerLogin() {
+  return async (req, res, next) => {
+    try {
+      const authPayload = getAuthPayloadFromRequest(req);
+      if (!authPayload || !authPayload.login) {
+        return res.status(401).json({ message: 'Token de autenticação inválido ou ausente.' });
+      }
+      const login = String(authPayload.login);
+      const usuario = await getUsuario(login);
+      if (!usuario) {
+        return res.status(400).json({ message: 'O usuário não existe no sistema.' });
+      }
+      if (!usuario.ativo) {
+        return res.status(401).json({ message: 'O usuário está bloqueado no sistema.' });
+      }
+      req.auth = {
+        preferred_username: login,
+        UsuarioId: usuario.id,
+      };
+      next();
+    } catch (error) {
+      console.error('Erro no middleware authBearerLogin:', error);
+      return res.status(401).json({ message: 'Não autorizado.' });
+    }
+  };
+}
+
 module.exports = {
   authorizeSemPerfilSelecionado,
   authorize,
+  authBearerLogin,
 };

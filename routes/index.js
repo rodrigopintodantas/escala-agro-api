@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const { authorize, authorizeSemPerfilSelecionado } = require('../auth/authorize');
+const { authorize, authorizeSemPerfilSelecionado, authBearerLogin } = require('../auth/authorize');
 
 const perfil = require('../auth/perfil');
 const _ROLES = require('../auth/role');
@@ -20,6 +20,7 @@ router.get('/', function (req, res) {
 });
 
 router.post('/auth/login', authCtl.login);
+router.post('/auth/alterar-senha', authBearerLogin(), authCtl.alterarSenha);
 router.get('/auth', authorizeSemPerfilSelecionado(), perfil);
 router.use('/usuario', require('./usuario'));
 router.use('/papel', authorize([_ROLES.ADMIN]), require('./papel'));

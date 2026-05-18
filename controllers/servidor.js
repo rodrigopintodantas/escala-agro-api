@@ -9,9 +9,27 @@ const listarVeterinarios = async (req, res, next) => {
   }
 };
 
+const listarTecnicos = async (req, res, next) => {
+  try {
+    const lista = await ServidorService.listarTecnicos();
+    res.status(200).json(lista);
+  } catch (err) {
+    next(err);
+  }
+};
+
 const excluirVeterinario = async (req, res, next) => {
   try {
     const resultado = await ServidorService.excluirVeterinario(req.params.id);
+    res.status(200).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
+const excluirTecnico = async (req, res, next) => {
+  try {
+    const resultado = await ServidorService.excluirTecnico(req.params.id);
     res.status(200).json(resultado);
   } catch (err) {
     next(err);
@@ -38,7 +56,9 @@ const reativarVeterinario = async (req, res, next) => {
 
 module.exports = {
   listarVeterinarios,
+  listarTecnicos,
   excluirVeterinario,
+  excluirTecnico,
   suspenderVeterinario,
   reativarVeterinario,
 };
