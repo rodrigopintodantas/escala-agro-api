@@ -277,13 +277,32 @@ describe('Afastamento férias/abono — retroativo ao cadastro', () => {
     expect(obterIdxRodizioAposUltimoPlantaoAntesDe(plantoes, ordem, '2026-07-01', 'veterinario')).toBe(1);
   });
 
+  test('idx técnico em 01/07 segue vaga 1 do último dia de junho (não só vaga 0)', () => {
+    const ordem = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    const plantoes = [
+      { dataReferencia: '2026-06-28', categoriaPlantao: 'tecnico', usuarioId: 15, vagaIndice: 0 },
+      { dataReferencia: '2026-06-28', categoriaPlantao: 'tecnico', usuarioId: 16, vagaIndice: 1 },
+    ];
+    expect(obterIdxRodizioAposUltimoPlantaoAntesDe(plantoes, ordem, '2026-07-01', 'tecnico')).toBe(0);
+    expect(
+      ordem[obterIdxRodizioAposUltimoPlantaoAntesDe(plantoes, ordem, '2026-07-01', 'tecnico')],
+    ).toBe(1);
+    const { simularRodizioTecPlantoes } = require('../escala.service').__testables;
+    const jul = ['2026-07-04', '2026-07-05'];
+    const idx = obterIdxRodizioAposUltimoPlantaoAntesDe(plantoes, ordem, '2026-07-01', 'tecnico');
+    const { alocacoes } = simularRodizioTecPlantoes(ordem, jul, [], new Set(), idx);
+    const letras = (uid) => ({ 1: 'A', 2: 'B', 3: 'C', 4: 'D', 5: 'E', 6: 'F', 7: 'G', 8: 'H', 9: 'I', 10: 'J', 11: 'K', 12: 'L', 13: 'M', 14: 'N', 15: 'O', 16: 'P' }[uid]);
+    const seq = alocacoes.map((a) => letras(a.usuarioId)).join('');
+    expect(seq.startsWith('AB')).toBe(true);
+  });
+
   test('retorno de Ana em 27/06 não deve ser reforçado em julho', () => {
     const plantoes = [
       { dataReferencia: '2026-06-27', categoriaPlantao: 'veterinario', usuarioId: 101, vagaIndice: 0 },
     ];
     const retornos = new Map([['2026-06-27', [101]]]);
     expect(
-      usuarioRetornoFeriasAbonoJaRealizadoAntesDe(101, '2026-07-01', retornos, plantoes),
+      usuarioRetornoFeriasAbonoJaRealizadoAntesDe(101, '2026-07-01', retornos, plantoes, 'veterinario'),
     ).toBe(true);
     expect(
       usuarioRetornoFeriasAbonoJaRealizadoAntesDe(101, '2026-07-01', retornos, []),
