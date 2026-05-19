@@ -122,6 +122,15 @@ function rotacionarOrdemAposUsuario(ordemIds, usuarioId) {
   return [...ids.slice(idx + 1), ...ids.slice(0, idx + 1)];
 }
 
+/** Coloca o próximo preferencial (`idxOrdem`) na posição 1 da fila persistida (Rodízio — veterinários). */
+function rotacionarOrdemParaProximoPreferencial(ordemUsuarioIds, idxOrdem) {
+  const ordem = (ordemUsuarioIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0);
+  const n = ordem.length;
+  if (n === 0) return ordem;
+  const i = ((Number(idxOrdem) % n) + n) % n;
+  return [...ordem.slice(i), ...ordem.slice(0, i)];
+}
+
 /**
  * Em escalas já concluídas, qualquer recálculo posterior deve preservar a regra de conclusão:
  * a ordem global deve iniciar após o veterinário do último plantão, respeitando o ciclo da
@@ -320,6 +329,65 @@ function moverUsuarioAntesDeReferencia(ordemUsuarioIds, usuarioMovidoId, referen
   return ordem;
 }
 
+/** Garante permutação única com todos os membros da escala (evita sumir H ou duplicar F). */
+function normalizarOrdemRodizioCompleta(ordemUsuarioIds, membrosIdsReferencia) {
+  const seen = new Set();
+  const out = [];
+  for (const id of ordemUsuarioIds || []) {
+    const uid = Number(id);
+    if (!Number.isFinite(uid) || uid < 1 || seen.has(uid)) continue;
+    seen.add(uid);
+    out.push(uid);
+  }
+  for (const id of membrosIdsReferencia || []) {
+    const uid = Number(id);
+    if (!Number.isFinite(uid) || uid < 1 || seen.has(uid)) continue;
+    seen.add(uid);
+    out.push(uid);
+  }
+  return out;
+}
+
+/**
+ * Férias/abono com a data de início mais cedo entre os afastamentos da escala (ex.: Bruno 05/06
+ * com Ana 08/06): recálculo focalizado preserva plantões já ajustados e corrompe a fila
+ * (ex.: CDEFBEAF sem G/H). Re-simula do histórico `inicial` com todos os afastamentos.
+ */
+function afastamentoExigeRecalculoPlenoComHistoricoInicial(afInicioIso, outrosAfastamentos) {
+  if (!afInicioIso || !Array.isArray(outrosAfastamentos) || outrosAfastamentos.length === 0) {
+    return false;
+  }
+  const inicios = [
+    afInicioIso,
+    ...outrosAfastamentos.map((a) => dataReferenciaParaStr(a.dataInicio)).filter(Boolean),
+  ];
+  const inicioMaisCedo = inicios.sort((a, b) => a.localeCompare(b))[0];
+  return afInicioIso === inicioMaisCedo;
+}
+
+/** Aplica ordem do histórico `inicial` quando cobre todos os membros ativos (permite tamanhos divergentes no raw). */
+function aplicarOrdemInicialHistoricoRodizio(idsInicial, membrosIdsReferencia) {
+  const norm = normalizarOrdemRodizioCompleta(idsInicial, membrosIdsReferencia);
+  if (membrosIdsReferencia.length > 0 && norm.length === membrosIdsReferencia.length) {
+    return norm;
+  }
+  return null;
+}
+
+async function ordemMembrosEscalaPorNomeAlfabetico(membrosIds, transaction) {
+  const ids = (membrosIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0);
+  if (ids.length === 0) return [];
+  const usuarios = await UsuarioModel.findAll({
+    where: { id: { [Op.in]: ids } },
+    attributes: ['id', 'nome'],
+    transaction,
+  });
+  return [...usuarios]
+    .sort((a, b) => compararUsuariosPorNomeAlfabetico(a, b))
+    .map((u) => Number(u.id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+}
+
 function montarAfastamentosPorUsuario(afastamentos) {
   const mapa = new Map();
   for (const af of afastamentos) {
@@ -385,6 +453,14 @@ function adicionarDiasIso(dataIso, dias) {
   return dataReferenciaParaStr(d);
 }
 
+/** Primeiro dia do mês seguinte a `dataIso` (ex.: 2026-06-22 → 2026-07-01). */
+function primeiroDiaMesSeguinte(dataIso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dataIso || ''))) return dataIso;
+  const d = new Date(`${dataIso}T12:00:00`);
+  d.setMonth(d.getMonth() + 1, 1);
+  return dataReferenciaParaStr(d);
+}
+
 function diaUtilDataIso(dataIso) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dataIso || ''))) return false;
   const d = new Date(`${dataIso}T12:00:00`);
@@ -429,6 +505,63 @@ function usuarioBloqueadoPosFeriasOuAbonoNoDia(afastamentosPorUsuario, usuarioId
   return false;
 }
 
+/**
+ * Férias/abono com início em D: remove o servidor de plantões anteriores a D quando não houve
+ * dia útil entre o plantão e D (inclui feriados em escalas de fim de semana).
+ * Usa `dataInicio` (não `createdAt`) para funcionar com cadastro antecipado.
+ */
+function usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+  afastamentosPorUsuario,
+  usuarioId,
+  dataIso,
+  datasNaoUteisIsoSet = new Set(),
+) {
+  const lista = afastamentosPorUsuario.get(Number(usuarioId)) || [];
+  for (const af of lista) {
+    if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) continue;
+    const inicioAfastamentoIso = dataReferenciaParaStr(af.dataInicio);
+    if (!inicioAfastamentoIso || dataIso >= inicioAfastamentoIso) continue;
+    const fimIso = dataReferenciaParaStr(af.dataFim);
+    if (dataNoIntervalo(dataIso, inicioAfastamentoIso, fimIso)) continue;
+    /** Dia útil estrito entre o plantão e o início do afastamento (o dia do plantão não conta). */
+    const primeiroDiaAposPlantao = adicionarDiasIso(dataIso, 1);
+    if (primeiroDiaAposPlantao >= inicioAfastamentoIso) {
+      return true;
+    }
+    if (!existeDiaUtilNoIntervalo(primeiroDiaAposPlantao, inicioAfastamentoIso, datasNaoUteisIsoSet)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Menor data de plantão potencialmente afetada pela regra retroativa (para expandir o recálculo).
+ */
+function calcularDataInicioRetroCadastro(inicioAfastamentoIso, datasNaoUteisIsoSet = new Set()) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(inicioAfastamentoIso || ''))) return inicioAfastamentoIso;
+  let earliest = inicioAfastamentoIso;
+  let p = adicionarDiasIso(inicioAfastamentoIso, -1);
+  const limite = adicionarDiasIso(inicioAfastamentoIso, -120);
+  while (p >= limite) {
+    if (p >= inicioAfastamentoIso) {
+      p = adicionarDiasIso(p, -1);
+      continue;
+    }
+    const primeiroAposP = adicionarDiasIso(p, 1);
+    const bloqueiaP =
+      primeiroAposP >= inicioAfastamentoIso ||
+      !existeDiaUtilNoIntervalo(primeiroAposP, inicioAfastamentoIso, datasNaoUteisIsoSet);
+    if (bloqueiaP) {
+      earliest = p;
+      p = adicionarDiasIso(p, -1);
+    } else {
+      break;
+    }
+  }
+  return earliest;
+}
+
 function usuarioIndisponivelParaPlantaoNoDia(
   afastamentosPorUsuario,
   usuarioId,
@@ -436,6 +569,9 @@ function usuarioIndisponivelParaPlantaoNoDia(
   datasNaoUteisIsoSet = new Set(),
 ) {
   if (afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioId, dataIso).length > 0) return true;
+  if (usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet)) {
+    return true;
+  }
   if (usuarioBloqueadoPosFeriasOuAbonoNoDia(afastamentosPorUsuario, usuarioId, dataIso, datasNaoUteisIsoSet)) return true;
   return false;
 }
@@ -510,6 +646,29 @@ function escolherRetornoFeriasDoDia(
     }
   }
   return escolhido;
+}
+
+/** Enfileira retornos de férias/abono do dia (usado ao pular plantão no modo focado). */
+function enfileirarRetornosFeriasDoDia(
+  dataIso,
+  ordemAtual,
+  retornosFeriasNoPrimeiroPlantao,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet,
+  filaRetornosFeriasPendentes,
+  idsExcluirMesmoDia = new Set(),
+) {
+  const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
+  for (const uidRaw of retornosHoje) {
+    const uid = Number(uidRaw);
+    if (!Number.isFinite(uid)) continue;
+    if (!ordemAtual.includes(uid)) continue;
+    if (idsExcluirMesmoDia.has(uid)) continue;
+    if (usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet)) continue;
+    if (!filaRetornosFeriasPendentes.includes(uid)) {
+      filaRetornosFeriasPendentes.push(uid);
+    }
+  }
 }
 
 async function obterMembrosAtivosEscala(escalaId, transaction) {
@@ -638,6 +797,295 @@ async function atualizarOrdemServidoresGlobalSemColisao(ordemUsuarioIds, transac
   );
 }
 
+/**
+ * Ajusta o índice do rodízio com base nos plantões já gravados antes de `dataLimiteIso`.
+ */
+/**
+ * Em recálculo com afastamentos anteriores na escala: só reprocessa plantões do servidor
+ * do afastamento atual (retroativo, período ativo, retorno). Demais datas mantêm a BD.
+ */
+function plantaoRequerRecalculoFocado(
+  usuarioAfetadoId,
+  plantao,
+  dataIso,
+  ordemAtual,
+  retornosFeriasNoPrimeiroPlantao,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet,
+) {
+  const uid = Number(usuarioAfetadoId);
+  if (!Number.isFinite(uid) || uid < 1 || !ordemAtual?.length) return false;
+  const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
+  if (retornosHoje.some((u) => Number(u) === uid)) return true;
+  if (Number(plantao.usuarioId) !== uid) return false;
+  return usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet);
+}
+
+function buscarProximoUsuarioDisponivelNoCiclo(
+  ordemAtual,
+  idxBase,
+  afastamentosPorUsuario,
+  dataIso,
+  datasNaoUteisIsoSet = new Set(),
+  idsExcluirMesmoDia = new Set(),
+  idsPular = new Set(),
+) {
+  if (!Array.isArray(ordemAtual) || ordemAtual.length === 0) return null;
+  const base = ((Number(idxBase) % ordemAtual.length) + ordemAtual.length) % ordemAtual.length;
+  for (let passo = 1; passo <= ordemAtual.length; passo++) {
+    const candidato = ordemAtual[(base + passo) % ordemAtual.length];
+    const uid = Number(candidato);
+    if (!Number.isFinite(uid) || uid < 1) continue;
+    if (idsPular.has(uid) || idsExcluirMesmoDia.has(uid)) continue;
+    const afastamentosCandidato = afastamentosAtivosNoDia(afastamentosPorUsuario, uid, dataIso);
+    const candidatoBloqueadoPosFeriasOuAbono = usuarioBloqueadoPosFeriasOuAbonoNoDia(
+      afastamentosPorUsuario,
+      uid,
+      dataIso,
+      datasNaoUteisIsoSet,
+    );
+    const candidatoSomenteAtestado =
+      !candidatoBloqueadoPosFeriasOuAbono &&
+      afastamentosCandidato.length > 0 &&
+      afastamentosCandidato.every((af) => afastamentoEhAtestado(af));
+    const candidatoIndisponivelReal =
+      candidatoBloqueadoPosFeriasOuAbono || (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
+    if (candidatoIndisponivelReal) continue;
+    return uid;
+  }
+  return null;
+}
+
+/**
+ * Retroativo focalizado em lote: cada plantão do titular antes do início do afastamento recebe
+ * substituto distinto, avançando o ciclo (evita Gabriela no sábado e domingo).
+ */
+async function processarRetroativoFocadoEmLote({
+  plantoes,
+  usuarioAfetadoId,
+  inicioAfastamentoIso,
+  categoriaPlantaoAlvo,
+  ordemAtual,
+  ordemGlobal,
+  idxInicial,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet,
+  transaction,
+  rotuloProfissional,
+}) {
+  const uid = Number(usuarioAfetadoId);
+  const idsProcessados = new Set();
+  let atualizados = 0;
+  let ordem = [...ordemAtual];
+  let og = [...ordemGlobal];
+  let idxBusca = Number(idxInicial) || 0;
+  let ultimaDataRetro = '';
+  let ultimoSubstituto = null;
+
+  const plantoesRetro = plantoes
+    .filter((p) => {
+      if (categoriaPlantaoDe(p) !== categoriaPlantaoAlvo) return false;
+      const ds = dataReferenciaParaStr(p.dataReferencia);
+      if (!ds || ds >= inicioAfastamentoIso) return false;
+      if (Number(p.usuarioId) !== uid) return false;
+      return usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(afastamentosPorUsuario, uid, ds, datasNaoUteisIsoSet);
+    })
+    .sort((a, b) => dataReferenciaParaStr(a.dataReferencia).localeCompare(dataReferenciaParaStr(b.dataReferencia)));
+
+  for (const plantao of plantoesRetro) {
+    const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+    const posTitular = ordem.indexOf(uid);
+    const idxParaBusca =
+      posTitular >= 0 ? posTitular : ((Number(idxBusca) % ordem.length) + ordem.length) % ordem.length;
+    const encontrado = buscarProximoUsuarioDisponivelNoCiclo(
+      ordem,
+      idxParaBusca,
+      afastamentosPorUsuario,
+      dataIso,
+      datasNaoUteisIsoSet,
+      new Set(),
+      new Set([uid]),
+    );
+    if (!encontrado) {
+      throw new ApiBaseError(`Não há ${rotuloProfissional.toLowerCase()} disponível para o plantão em ${dataIso}.`);
+    }
+    ordem = moverUsuarioDepoisDaCobertura(ordem, uid, encontrado);
+    og = moverUsuarioDepoisDaCobertura(og, uid, encontrado);
+    /** Próximo plantão: após o ausente na fila (não repetir o titular como preferencial). */
+    idxBusca = (ordem.indexOf(uid) + 1) % ordem.length;
+    ultimaDataRetro = dataIso;
+    ultimoSubstituto = encontrado;
+    if (Number(plantao.usuarioId) !== encontrado) {
+      plantao.usuarioId = encontrado;
+      plantao.observacao = null;
+      await plantao.save({ transaction });
+      atualizados += 1;
+    }
+    idsProcessados.add(Number(plantao.id));
+  }
+
+  if (ultimoSubstituto != null && ultimaDataRetro) {
+    const corrigidos = await corrigirCoberturaDuplicadaAposRetro({
+      plantoes,
+      inicioAfastamentoIso,
+      ultimaDataRetroIso: ultimaDataRetro,
+      ultimoSubstitutoId: ultimoSubstituto,
+      titularAfastadoId: uid,
+      categoriaPlantaoAlvo,
+      ordemAtual: ordem,
+      ordemGlobal: og,
+      idxBusca,
+      afastamentosPorUsuario,
+      datasNaoUteisIsoSet,
+      transaction,
+      idsProcessados,
+      rotuloProfissional,
+    });
+    ordem = corrigidos.ordemAtual;
+    og = corrigidos.ordemGlobal;
+    idxBusca = corrigidos.idxBusca;
+    atualizados += corrigidos.atualizados;
+  }
+
+  return { ordemAtual: ordem, ordemGlobal: og, idxOrdem: idxBusca, idsProcessados, atualizados };
+}
+
+/** Plantão entre o último retroativo e o início do afastamento que ficou com o mesmo substituto (ex.: domingo). */
+async function corrigirCoberturaDuplicadaAposRetro({
+  plantoes,
+  inicioAfastamentoIso,
+  ultimaDataRetroIso,
+  ultimoSubstitutoId,
+  titularAfastadoId = null,
+  categoriaPlantaoAlvo,
+  ordemAtual,
+  ordemGlobal,
+  idxBusca,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet,
+  transaction,
+  idsProcessados,
+  rotuloProfissional,
+}) {
+  let ordem = ordemAtual;
+  let og = ordemGlobal;
+  let idx = idxBusca;
+  let atualizados = 0;
+  const primeiroAposUltimoRetro = adicionarDiasIso(ultimaDataRetroIso, 1);
+  const substitutoId = Number(ultimoSubstitutoId);
+  const titularId = Number(titularAfastadoId);
+  const idsPularSubstituicao = new Set([substitutoId]);
+  if (Number.isFinite(titularId) && titularId > 0) idsPularSubstituicao.add(titularId);
+
+  for (const plantao of plantoes) {
+    if (categoriaPlantaoDe(plantao) !== categoriaPlantaoAlvo) continue;
+    const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+    if (!dataIso || dataIso >= inicioAfastamentoIso || dataIso < primeiroAposUltimoRetro) continue;
+    if (Number(plantao.usuarioId) !== substitutoId) continue;
+    if (idsProcessados.has(Number(plantao.id))) continue;
+    if (existeDiaUtilNoIntervalo(primeiroAposUltimoRetro, dataIso, datasNaoUteisIsoSet)) continue;
+
+    const posSubstituto = ordem.indexOf(substitutoId);
+    const encontrado = buscarProximoUsuarioDisponivelNoCiclo(
+      ordem,
+      posSubstituto >= 0 ? posSubstituto : idx,
+      afastamentosPorUsuario,
+      dataIso,
+      datasNaoUteisIsoSet,
+      new Set(),
+      idsPularSubstituicao,
+    );
+    if (!encontrado) {
+      throw new ApiBaseError(`Não há ${rotuloProfissional.toLowerCase()} disponível para o plantão em ${dataIso}.`);
+    }
+    if (Number(plantao.usuarioId) !== encontrado) {
+      plantao.usuarioId = encontrado;
+      plantao.observacao = null;
+      await plantao.save({ transaction });
+      atualizados += 1;
+    }
+    idx = (ordem.indexOf(encontrado) + 1) % ordem.length;
+    idsProcessados.add(Number(plantao.id));
+  }
+
+  return { ordemAtual: ordem, ordemGlobal: og, idxBusca: idx, atualizados };
+}
+
+function avancarIdxOrdemAPartirDoPlantao(plantao, ordemAtual, catPlantao, idxState) {
+  const uid = Number(plantao.usuarioId);
+  if (!ordemAtual.length || !Number.isFinite(uid) || uid < 1) return;
+  const pos = ordemAtual.indexOf(uid);
+  if (pos < 0) return;
+  const next = (pos + 1) % ordemAtual.length;
+  if (catPlantao === CATEGORIA_PLANTAO.TECNICO) idxState.idxTec = next;
+  else idxState.idxVet = next;
+}
+
+function sincronizarIdxOrdemDePlantoes(plantoes, ordemAtualVet, ordemAtualTec, dataLimiteIso) {
+  let idxVet = 0;
+  let idxTec = 0;
+  if (!dataLimiteIso || !Array.isArray(plantoes)) {
+    return { idxVet, idxTec };
+  }
+  for (const plantao of plantoes) {
+    const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+    if (!dataIso || dataIso >= dataLimiteIso) break;
+    const cat = categoriaPlantaoDe(plantao);
+    const ordem = cat === CATEGORIA_PLANTAO.TECNICO ? ordemAtualTec : ordemAtualVet;
+    const uid = Number(plantao.usuarioId);
+    if (!ordem.length || !Number.isFinite(uid) || uid < 1) continue;
+    const pos = ordem.indexOf(uid);
+    if (pos < 0) continue;
+    const next = (pos + 1) % ordem.length;
+    if (cat === CATEGORIA_PLANTAO.TECNICO) idxTec = next;
+    else idxVet = next;
+  }
+  return { idxVet, idxTec };
+}
+
+/**
+ * Próximo índice do rodízio após o último plantão gravado antes de `dataLimiteIso`
+ * (usa titulares de junho já corretos; evita idx derivado de simulação parcial).
+ */
+function obterIdxRodizioAposUltimoPlantaoAntesDe(
+  plantoes,
+  ordemAtual,
+  dataLimiteIso,
+  categoriaAlvo = CATEGORIA_PLANTAO.VETERINARIO,
+) {
+  if (!dataLimiteIso || !Array.isArray(plantoes) || !ordemAtual?.length) return 0;
+  let lastUid = null;
+  for (const plantao of plantoes) {
+    const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+    if (!dataIso || dataIso >= dataLimiteIso) continue;
+    if (categoriaPlantaoDe(plantao) !== categoriaAlvo) continue;
+    if (categoriaAlvo === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) !== 0) continue;
+    const uid = Number(plantao.usuarioId);
+    if (Number.isFinite(uid) && uid > 0) lastUid = uid;
+  }
+  if (lastUid == null) return 0;
+  const pos = ordemAtual.indexOf(lastUid);
+  return pos < 0 ? 0 : (pos + 1) % ordemAtual.length;
+}
+
+/** Retorno de férias/abono já ocorreu em plantão anterior ao recálculo pleno do mês seguinte. */
+function usuarioRetornoFeriasAbonoJaRealizadoAntesDe(usuarioId, dataLimiteIso, retornosFeriasNoPrimeiroPlantao, plantoes) {
+  const uid = Number(usuarioId);
+  if (!Number.isFinite(uid) || uid < 1 || !dataLimiteIso) return false;
+  for (const [dataRetorno, uids] of retornosFeriasNoPrimeiroPlantao.entries()) {
+    if (dataRetorno >= dataLimiteIso) continue;
+    if (!(uids || []).some((u) => Number(u) === uid)) continue;
+    const tevePlantao = plantoes.some(
+      (p) =>
+        categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+        dataReferenciaParaStr(p.dataReferencia) === dataRetorno &&
+        Number(p.usuarioId) === uid,
+    );
+    if (tevePlantao) return true;
+  }
+  return false;
+}
+
 async function buscarHistoricoOrdemParaAfastamento(escalaId, afastamentoId, categoriaOrdem, transaction) {
   const cat = String(categoriaOrdem || '').toLowerCase();
   let hist = await EscalaOrdemHistoricoModel.findOne({
@@ -689,6 +1137,140 @@ async function registrarEventoAuditoriaEscala({
   );
 }
 
+/**
+ * Simula o rodízio de veterinários (sem modo focalizado) — usado em testes e depuração.
+ */
+function simularRodizioVetPlantoes(ordemInicial, datasPlantaoIso, afastamentosFlat, datasNaoUteisIsoSet = new Set()) {
+  let ordemAtual = [...ordemInicial];
+  let ordemGlobal = [...ordemInicial];
+  let idxOrdem = 0;
+  const membrosRef = [...ordemInicial];
+  const afastamentosPorUsuario = montarAfastamentosPorUsuario(afastamentosFlat);
+  const plantoes = (datasPlantaoIso || []).map((dataReferencia) => ({
+    dataReferencia,
+    categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO,
+  }));
+  const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
+    afastamentosFlat,
+    plantoes,
+    datasNaoUteisIsoSet,
+  );
+  const filaRetornosFeriasPendentes = [];
+  const alocacoes = [];
+
+  for (const plantao of plantoes) {
+    const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+    if (!ordemAtual.length) continue;
+
+    const idxPreferencial = idxOrdem % ordemAtual.length;
+    const usuarioPreferencial = ordemAtual[idxPreferencial];
+    const idxBaseBuscaSubstituto = idxPreferencial;
+
+    const afastamentosPreferencial = afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioPreferencial, dataIso);
+    const preferencialBloqueadoPosFerias = usuarioBloqueadoPosFeriasOuAbonoNoDia(
+      afastamentosPorUsuario,
+      usuarioPreferencial,
+      dataIso,
+      datasNaoUteisIsoSet,
+    );
+    const preferencialBloqueadoRetroCadastro = usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+      afastamentosPorUsuario,
+      usuarioPreferencial,
+      dataIso,
+      datasNaoUteisIsoSet,
+    );
+    const preferencialIndisponivel = usuarioIndisponivelParaPlantaoNoDia(
+      afastamentosPorUsuario,
+      usuarioPreferencial,
+      dataIso,
+      datasNaoUteisIsoSet,
+    );
+
+    let usuarioAlocado = usuarioPreferencial;
+    const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
+    for (const uidRaw of retornosHoje) {
+      const uid = Number(uidRaw);
+      if (!Number.isFinite(uid) || !ordemAtual.includes(uid)) continue;
+      if (!filaRetornosFeriasPendentes.includes(uid)) {
+        filaRetornosFeriasPendentes.push(uid);
+      }
+    }
+    const retornoFeriasForcado = escolherRetornoFeriasDoDia(
+      filaRetornosFeriasPendentes,
+      ordemAtual,
+      idxPreferencial,
+      afastamentosPorUsuario,
+      dataIso,
+      datasNaoUteisIsoSet,
+      new Set(),
+    );
+
+    if (retornoFeriasForcado != null) {
+      usuarioAlocado = retornoFeriasForcado;
+      if (Number(usuarioAlocado) !== Number(usuarioPreferencial)) {
+        ordemAtual = moverUsuarioAntesDeReferencia(ordemAtual, usuarioAlocado, usuarioPreferencial);
+        ordemGlobal = moverUsuarioAntesDeReferencia(ordemGlobal, usuarioAlocado, usuarioPreferencial);
+      }
+      idxOrdem = (ordemAtual.indexOf(usuarioAlocado) + 1) % ordemAtual.length;
+    } else if (preferencialIndisponivel) {
+      const gestaoAtestado =
+        !preferencialBloqueadoPosFerias &&
+        afastamentosPreferencial.length > 0 &&
+        afastamentosPreferencial.every((af) => afastamentoEhAtestado(af));
+      if (gestaoAtestado) {
+        usuarioAlocado = usuarioPreferencial;
+        idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
+      } else {
+        let encontrado = null;
+        for (let passo = 1; passo <= ordemAtual.length; passo++) {
+          const candidato = ordemAtual[(idxBaseBuscaSubstituto + passo) % ordemAtual.length];
+          const afastamentosCandidato = afastamentosAtivosNoDia(afastamentosPorUsuario, candidato, dataIso);
+          const candidatoBloqueadoPosFeriasOuAbono = usuarioBloqueadoPosFeriasOuAbonoNoDia(
+            afastamentosPorUsuario,
+            candidato,
+            dataIso,
+            datasNaoUteisIsoSet,
+          );
+          const candidatoSomenteAtestado =
+            !candidatoBloqueadoPosFeriasOuAbono &&
+            afastamentosCandidato.length > 0 &&
+            afastamentosCandidato.every((af) => afastamentoEhAtestado(af));
+          const candidatoIndisponivelReal =
+            candidatoBloqueadoPosFeriasOuAbono || (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
+          if (candidatoIndisponivelReal) continue;
+          encontrado = candidato;
+          break;
+        }
+        if (!encontrado) {
+          throw new ApiBaseError(`Não há veterinário disponível para o plantão em ${dataIso}.`);
+        }
+        usuarioAlocado = encontrado;
+        const deveAlterarOrdem =
+          afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) ||
+          preferencialBloqueadoPosFerias ||
+          preferencialBloqueadoRetroCadastro;
+        if (deveAlterarOrdem) {
+          ordemAtual = moverUsuarioDepoisDaCobertura(ordemAtual, usuarioPreferencial, usuarioAlocado);
+          ordemGlobal = moverUsuarioDepoisDaCobertura(ordemGlobal, usuarioPreferencial, usuarioAlocado);
+          idxOrdem = (ordemAtual.indexOf(usuarioPreferencial) + 1) % ordemAtual.length;
+        } else {
+          idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
+        }
+      }
+    } else {
+      idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
+    }
+
+    const idxFila = filaRetornosFeriasPendentes.indexOf(Number(usuarioAlocado));
+    if (idxFila >= 0) filaRetornosFeriasPendentes.splice(idxFila, 1);
+    alocacoes.push({ dataIso, usuarioId: usuarioAlocado });
+  }
+
+  const ordemNormalizada = normalizarOrdemRodizioCompleta(ordemAtual, membrosRef);
+  const ordemPersistida = rotacionarOrdemParaProximoPreferencial(ordemNormalizada, idxOrdem);
+  return { ordemAtual: ordemNormalizada, idxOrdem, ordemPersistida, alocacoes };
+}
+
 async function recalcularEscalaInterno(
   escalaId,
   {
@@ -738,6 +1320,9 @@ async function recalcularEscalaInterno(
 
   /** Inclui datas extras, desfazer afastamento, e afastamento sem bootstrap `maisTarde`. */
   let usarHistoricoInicialRodizio = skipBootstrap || historicoMotivo === 'apos_desfazer_afastamento';
+  /** Com afastamentos anteriores: não re-simular do `inicial`; recálculo focalizado no servidor atual. */
+  let preservarPlantoesAntesDe = null;
+  let recalcComAfastamentosAnteriores = false;
 
   /**
    * Ao recalcular por um afastamento A com fim em D, afastamentos já cadastrados com início > D
@@ -748,6 +1333,7 @@ async function recalcularEscalaInterno(
    */
   if (historicoMotivo === 'afastamento' && historicoAfastamento) {
     const afFimRef = dataReferenciaParaStr(historicoAfastamento.dataFim);
+    const afInicioRef = dataReferenciaParaStr(historicoAfastamento.dataInicio);
     const idAtual = Number(historicoAfastamento.id);
     const outros = await AfastamentoModel.findAll({
       where: {
@@ -761,7 +1347,19 @@ async function recalcularEscalaInterno(
     const maisTarde = outros
       .filter((a) => dataReferenciaParaStr(a.dataInicio) > afFimRef)
       .sort((a, b) => dataReferenciaParaStr(a.dataInicio).localeCompare(dataReferenciaParaStr(b.dataInicio)));
-    if (maisTarde.length > 0) {
+    /**
+     * Bootstrap "antes" do afastamento com início depois do fim deste só quando nenhum outro afastamento
+     * já alterou a mesma janela (ex.: maio vs férias em junho). Com Ana + Felipe já em junho e novo abono
+     * da Elisa em 15/06, não voltar ao snapshot anterior ao Felipe (22) — isso re-simulava junho inteiro
+     * e corrompia a ordem (ex.: BCDFEGAF sem H).
+     */
+    const algumOutroSobrepostoAoPeriodoAtual = outros.some((a) => {
+      const oIni = dataReferenciaParaStr(a.dataInicio);
+      const oFim = dataReferenciaParaStr(a.dataFim);
+      return oIni <= afFimRef && oFim >= afInicioRef;
+    });
+    const podeBootstrapAntesMaisTarde = maisTarde.length > 0 && !algumOutroSobrepostoAoPeriodoAtual;
+    if (podeBootstrapAntesMaisTarde) {
       const primeiro = maisTarde[0];
       const catPrimeiro =
         (await escopoOrdemGlobalParaUsuarioId(primeiro.usuarioId, transaction)) === ESCOPO_ORDEM.TECNICO
@@ -777,6 +1375,46 @@ async function recalcularEscalaInterno(
         const oa = hist.ordemUsuarioIdsAntes.map((x) => Number(x));
         if (catPrimeiro === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = oa;
         else ordemAtualVet = oa;
+      }
+    } else if (outros.length > 0) {
+      if (afastamentoExigeRecalculoPlenoComHistoricoInicial(afInicioRef, outros)) {
+        /**
+         * Ex.: Bruno 05–12/06 cadastrado após Ana/Elisa/Felipe — início mais cedo no calendário.
+         * Reprocessa todos os plantões (não focalizado), mas mantém a fila já gravada na escala
+         * (ex.: BCDGEHFA após 3 afastamentos). Voltar ao histórico `inicial` (ABCDEFGH) e simular
+         * os quatro afastamentos de uma vez gera plantões de junho CDEFBEAF em vez de CDGH…
+         */
+        usarHistoricoInicialRodizio = outros.length === 0;
+        recalcComAfastamentosAnteriores = false;
+      } else {
+        /**
+         * Já existe afastamento anterior (ex.: férias da Ana). Re-simular desde o histórico `inicial`
+         * desfaz o rodízio pós-recálculo e ignora retroativo do novo abono/férias (Felipe no dia 20).
+         * Continua da ordem registrada no último afastamento e só reprocessa plantões a partir da janela retroativa.
+         */
+        usarHistoricoInicialRodizio = false;
+        recalcComAfastamentosAnteriores = true;
+        const porFimDesc = [...outros].sort((a, b) => {
+          const cmpFim = dataReferenciaParaStr(b.dataFim).localeCompare(dataReferenciaParaStr(a.dataFim));
+          if (cmpFim !== 0) return cmpFim;
+          return dataReferenciaParaStr(b.dataInicio).localeCompare(dataReferenciaParaStr(a.dataInicio));
+        });
+        for (const outro of porFimDesc) {
+          const catOutro =
+            (await escopoOrdemGlobalParaUsuarioId(outro.usuarioId, transaction)) === ESCOPO_ORDEM.TECNICO
+              ? CATEGORIA_MEMBRO.TECNICO
+              : CATEGORIA_MEMBRO.VETERINARIO;
+          const histOutro = await buscarHistoricoOrdemParaAfastamento(escalaId, outro.id, catOutro, transaction);
+          if (!histOutro) continue;
+          const plainOutro = histOutro.get ? histOutro.get({ plain: true }) : histOutro;
+          const idsDepois = Array.isArray(plainOutro.ordemUsuarioIds)
+            ? plainOutro.ordemUsuarioIds.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+            : [];
+          if (idsDepois.length === 0) continue;
+          if (catOutro === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = idsDepois;
+          else ordemAtualVet = idsDepois;
+          break;
+        }
       }
     } else {
       usarHistoricoInicialRodizio = true;
@@ -823,6 +1461,8 @@ async function recalcularEscalaInterno(
     }
   }
 
+  let aplicouOrdemInicialVet = false;
+  let aplicouOrdemInicialTec = false;
   if (usarHistoricoInicialRodizio) {
     const histsInicial = await EscalaOrdemHistoricoModel.findAll({
       where: { escalaId, motivo: 'inicial' },
@@ -836,18 +1476,21 @@ async function recalcularEscalaInterno(
         String(catRaw || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
       const alvoIds = cat === CATEGORIA_MEMBRO.TECNICO ? ordemAtualDbInicialTec : ordemAtualDbInicialVet;
       const idsInicial = Array.isArray(plain.ordemUsuarioIds) ? plain.ordemUsuarioIds.map((x) => Number(x)) : [];
-      const membrosSet = new Set(alvoIds);
-      if (
-        idsInicial.length > 0 &&
-        alvoIds.length > 0 &&
-        idsInicial.length === alvoIds.length &&
-        idsInicial.every((id) => membrosSet.has(Number(id)))
-      ) {
-        if (cat === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = idsInicial;
-        else ordemAtualVet = idsInicial;
+      const aplicada = aplicarOrdemInicialHistoricoRodizio(idsInicial, alvoIds);
+      if (aplicada) {
+        if (cat === CATEGORIA_MEMBRO.TECNICO) {
+          ordemAtualTec = aplicada;
+          aplicouOrdemInicialTec = true;
+        } else {
+          ordemAtualVet = aplicada;
+          aplicouOrdemInicialVet = true;
+        }
       }
       if (Array.isArray(plain.ordemGlobalUsuarioIds) && plain.ordemGlobalUsuarioIds.length > 0) {
-        const og = plain.ordemGlobalUsuarioIds.map((x) => Number(x));
+        const og = normalizarOrdemRodizioCompleta(
+          plain.ordemGlobalUsuarioIds.map((x) => Number(x)),
+          cat === CATEGORIA_MEMBRO.TECNICO ? ordemGlobalDbInicialTec : ordemGlobalDbInicialVet,
+        );
         if (cat === CATEGORIA_MEMBRO.TECNICO) ordemGlobalTec = og;
         else ordemGlobalVet = og;
       }
@@ -904,6 +1547,26 @@ async function recalcularEscalaInterno(
 
   const primeiroUsuarioNoDiaTech = new Map();
 
+  const modoRecalculoFocado = Boolean(
+    recalcComAfastamentosAnteriores && historicoMotivo === 'afastamento' && historicoAfastamento,
+  );
+  let usuarioAfetadoRecalculoId = null;
+  /**
+   * Com afastamento anterior + novo (ex.: Ana depois abono Felipe em 22/06): plantões fora do foco
+   * são pulados em junho para não mexer em dias de outros servidores. A partir do 1º dia do mês
+   * seguinte ao fim do afastamento atual, re-simula o rodízio inteiro (ex.: julho alinhado a junho).
+   */
+  let dataLimitePuloFocado = null;
+  let idxSincronizadoParaMesSeguinte = false;
+  if (modoRecalculoFocado) {
+    const afFocado = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
+    const uidFocado = Number(afFocado.usuarioId);
+    if (Number.isFinite(uidFocado) && uidFocado > 0) usuarioAfetadoRecalculoId = uidFocado;
+    const fimAfIso = dataReferenciaParaStr(afFocado.dataFim);
+    if (fimAfIso) dataLimitePuloFocado = primeiroDiaMesSeguinte(fimAfIso);
+  }
+  const idxState = { idxVet: 0, idxTec: 0 };
+
   if (plantoes.some((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO) && ordemAtualDbInicialVet.length === 0) {
     throw new ApiBaseError('Escala sem veterinários no rodízio para os plantões de veterinário.');
   }
@@ -913,11 +1576,104 @@ async function recalcularEscalaInterno(
 
   let idxOrdemVet = 0;
   let idxOrdemTec = 0;
+
+  if (usarHistoricoInicialRodizio) {
+    if (!aplicouOrdemInicialVet && ordemAtualDbInicialVet.length > 0) {
+      ordemAtualVet = await ordemMembrosEscalaPorNomeAlfabetico(ordemAtualDbInicialVet, transaction);
+    }
+    if (!aplicouOrdemInicialTec && ordemAtualDbInicialTec.length > 0) {
+      ordemAtualTec = await ordemMembrosEscalaPorNomeAlfabetico(ordemAtualDbInicialTec, transaction);
+    }
+    idxOrdemVet = 0;
+    idxOrdemTec = 0;
+    idxState.idxVet = 0;
+    idxState.idxTec = 0;
+  }
+
+  if (modoRecalculoFocado && usuarioAfetadoRecalculoId != null) {
+    const datasRelevantes = plantoes
+      .filter((p) => {
+        const cat = categoriaPlantaoDe(p);
+        const ordem = cat === CATEGORIA_PLANTAO.TECNICO ? ordemAtualTec : ordemAtualVet;
+        return plantaoRequerRecalculoFocado(
+          usuarioAfetadoRecalculoId,
+          p,
+          dataReferenciaParaStr(p.dataReferencia),
+          ordem,
+          retornosFeriasNoPrimeiroPlantao,
+          afastamentosPorUsuario,
+          datasNaoUteisParaRetornoPosAfastamento,
+        );
+      })
+      .map((p) => dataReferenciaParaStr(p.dataReferencia))
+      .filter((ds) => !!ds)
+      .sort();
+    const primeiraDataRelevante = datasRelevantes[0];
+    if (primeiraDataRelevante) {
+      const idxSync = sincronizarIdxOrdemDePlantoes(
+        plantoes,
+        ordemAtualVet,
+        ordemAtualTec,
+        primeiraDataRelevante,
+      );
+      idxOrdemVet = idxSync.idxVet;
+      idxOrdemTec = idxSync.idxTec;
+      idxState.idxVet = idxOrdemVet;
+      idxState.idxTec = idxOrdemTec;
+    }
+  }
   let atualizados = 0;
+  const plantaoIdsRetroLote = new Set();
+
+  if (modoRecalculoFocado && usuarioAfetadoRecalculoId != null && historicoAfastamento) {
+    const afFocLote = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
+    const inicioIsoLote = dataReferenciaParaStr(afFocLote.dataInicio);
+    if (
+      inicioIsoLote &&
+      (afastamentoEhFerias(afFocLote) || afastamentoEhAbono(afFocLote))
+    ) {
+      const escopoAf = await escopoOrdemGlobalParaUsuarioId(usuarioAfetadoRecalculoId, transaction);
+      const catLote =
+        escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_PLANTAO.TECNICO : CATEGORIA_PLANTAO.VETERINARIO;
+      const rotuloLote = catLote === CATEGORIA_PLANTAO.TECNICO ? 'Técnico' : 'Veterinário';
+      const ordemLote = catLote === CATEGORIA_PLANTAO.TECNICO ? ordemAtualTec : ordemAtualVet;
+      const ogLote = catLote === CATEGORIA_PLANTAO.TECNICO ? ordemGlobalTec : ordemGlobalVet;
+      const idxLote = catLote === CATEGORIA_PLANTAO.TECNICO ? idxOrdemTec : idxOrdemVet;
+      if (ordemLote.length > 0) {
+        const lote = await processarRetroativoFocadoEmLote({
+          plantoes,
+          usuarioAfetadoId: usuarioAfetadoRecalculoId,
+          inicioAfastamentoIso: inicioIsoLote,
+          categoriaPlantaoAlvo: catLote,
+          ordemAtual: ordemLote,
+          ordemGlobal: ogLote,
+          idxInicial: idxLote,
+          afastamentosPorUsuario,
+          datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+          transaction,
+          rotuloProfissional: rotuloLote,
+        });
+        if (catLote === CATEGORIA_PLANTAO.TECNICO) {
+          ordemAtualTec = lote.ordemAtual;
+          ordemGlobalTec = lote.ordemGlobal;
+          idxOrdemTec = lote.idxOrdem;
+          idxState.idxTec = idxOrdemTec;
+        } else {
+          ordemAtualVet = lote.ordemAtual;
+          ordemGlobalVet = lote.ordemGlobal;
+          idxOrdemVet = lote.idxOrdem;
+          idxState.idxVet = idxOrdemVet;
+        }
+        atualizados += lote.atualizados;
+        for (const id of lote.idsProcessados) plantaoIdsRetroLote.add(id);
+      }
+    }
+  }
 
   for (const plantao of plantoes) {
     const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
     const catPlantao = categoriaPlantaoDe(plantao);
+
     let ordemAtual = catPlantao === CATEGORIA_PLANTAO.TECNICO ? ordemAtualTec : ordemAtualVet;
     let ordemGlobal = catPlantao === CATEGORIA_PLANTAO.TECNICO ? ordemGlobalTec : ordemGlobalVet;
     let idxOrdem = catPlantao === CATEGORIA_PLANTAO.TECNICO ? idxOrdemTec : idxOrdemVet;
@@ -927,6 +1683,94 @@ async function recalcularEscalaInterno(
 
     if (!ordemAtual.length) continue;
 
+    /** Recálculo pleno no mês seguinte só quando junho foi “pulado” (modo focalizado). Recálculo do `inicial` simula tudo seguido. */
+    const recalculoPlenoNestePlantao = Boolean(
+      modoRecalculoFocado && dataLimitePuloFocado && dataIso >= dataLimitePuloFocado,
+    );
+
+    if (recalculoPlenoNestePlantao && !idxSincronizadoParaMesSeguinte) {
+      filaRetornosFeriasPendentes.length = 0;
+      primeiroUsuarioNoDiaTech.clear();
+      idxOrdemVet = obterIdxRodizioAposUltimoPlantaoAntesDe(
+        plantoes,
+        ordemAtualVet,
+        dataLimitePuloFocado,
+        CATEGORIA_PLANTAO.VETERINARIO,
+      );
+      idxOrdemTec = obterIdxRodizioAposUltimoPlantaoAntesDe(
+        plantoes,
+        ordemAtualTec,
+        dataLimitePuloFocado,
+        CATEGORIA_PLANTAO.TECNICO,
+      );
+      idxState.idxVet = idxOrdemVet;
+      idxState.idxTec = idxOrdemTec;
+      idxSincronizadoParaMesSeguinte = true;
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO) idxOrdem = idxOrdemTec;
+      else idxOrdem = idxOrdemVet;
+    }
+
+    const aplicarModoFocadoNoPlantao = modoRecalculoFocado && !recalculoPlenoNestePlantao;
+
+    if (plantaoIdsRetroLote.has(Number(plantao.id))) {
+      avancarIdxOrdemAPartirDoPlantao(plantao, ordemAtual, catPlantao, idxState);
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO) idxOrdemTec = idxState.idxTec;
+      else idxOrdemVet = idxState.idxVet;
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 0) {
+        const uid0 = Number(plantao.usuarioId);
+        if (Number.isFinite(uid0) && uid0 > 0) {
+          primeiroUsuarioNoDiaTech.set(dataIso, uid0);
+        }
+      }
+      continue;
+    }
+
+    const plantaoExigeRecalculoFocado =
+      aplicarModoFocadoNoPlantao &&
+      usuarioAfetadoRecalculoId != null &&
+      (plantaoRequerRecalculoFocado(
+        usuarioAfetadoRecalculoId,
+        plantao,
+        dataIso,
+        ordemAtual,
+        retornosFeriasNoPrimeiroPlantao,
+        afastamentosPorUsuario,
+        datasNaoUteisParaRetornoPosAfastamento,
+      ) ||
+        filaRetornosFeriasPendentes.length > 0);
+
+    const podePularPlantaoNoModoFocado =
+      aplicarModoFocadoNoPlantao &&
+      usuarioAfetadoRecalculoId != null &&
+      !plantaoExigeRecalculoFocado;
+
+    if (podePularPlantaoNoModoFocado) {
+      const idsExcluirRetornoSkip = new Set();
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 1) {
+        const u0 = primeiroUsuarioNoDiaTech.get(dataIso);
+        if (u0 != null) idsExcluirRetornoSkip.add(Number(u0));
+      }
+      enfileirarRetornosFeriasDoDia(
+        dataIso,
+        ordemAtual,
+        retornosFeriasNoPrimeiroPlantao,
+        afastamentosPorUsuario,
+        datasNaoUteisParaRetornoPosAfastamento,
+        filaRetornosFeriasPendentes,
+        idsExcluirRetornoSkip,
+      );
+      avancarIdxOrdemAPartirDoPlantao(plantao, ordemAtual, catPlantao, idxState);
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO) idxOrdemTec = idxState.idxTec;
+      else idxOrdemVet = idxState.idxVet;
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 0) {
+        const uid0 = Number(plantao.usuarioId);
+        if (Number.isFinite(uid0) && uid0 > 0) {
+          primeiroUsuarioNoDiaTech.set(dataIso, uid0);
+        }
+      }
+      continue;
+    }
+
     let observacaoPlantao = null;
 
     const idsExcluirMesmoDia = new Set();
@@ -935,10 +1779,48 @@ async function recalcularEscalaInterno(
       if (u0 != null) idsExcluirMesmoDia.add(Number(u0));
     }
 
-    const idxPreferencial = idxOrdem % ordemAtual.length;
-    const usuarioPreferencial = ordemAtual[idxPreferencial];
+    let idxPreferencial = idxOrdem % ordemAtual.length;
+    let usuarioPreferencial = ordemAtual[idxPreferencial];
+    /** Base da busca por substituto (pode diferir do preferencial em retroativo focalizado). */
+    let idxBaseBuscaSubstituto = idxPreferencial;
+    let titularIndisponivelNoPlantao = null;
+    if (
+      aplicarModoFocadoNoPlantao &&
+      usuarioAfetadoRecalculoId != null &&
+      Number(plantao.usuarioId) === usuarioAfetadoRecalculoId
+    ) {
+      const posAfetado = ordemAtual.indexOf(usuarioAfetadoRecalculoId);
+      if (posAfetado >= 0) {
+        titularIndisponivelNoPlantao = usuarioAfetadoRecalculoId;
+        usuarioPreferencial = usuarioAfetadoRecalculoId;
+        idxPreferencial = posAfetado;
+        const afFoc = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
+        const inicioAfIso = dataReferenciaParaStr(afFoc.dataInicio);
+        const retroTitular =
+          !!inicioAfIso &&
+          dataIso < inicioAfIso &&
+          usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+            afastamentosPorUsuario,
+            usuarioAfetadoRecalculoId,
+            dataIso,
+            datasNaoUteisParaRetornoPosAfastamento,
+          );
+        /**
+         * Retroativo em sequência (ex.: sábado e domingo antes do abono na segunda): após cobrir o
+         * sábado, o domingo deve seguir o ciclo (Henrique), não voltar a buscar a partir do Felipe
+         * (o que repetia Gabriela).
+         */
+        idxBaseBuscaSubstituto = retroTitular ? idxOrdem % ordemAtual.length : posAfetado;
+      }
+    }
     const afastamentosPreferencial = afastamentosAtivosNoDia(afastamentosPorUsuario, usuarioPreferencial, dataIso);
     const preferencialBloqueadoPosFerias = usuarioBloqueadoPosFeriasOuAbonoNoDia(
+      afastamentosPorUsuario,
+      usuarioPreferencial,
+      dataIso,
+      datasNaoUteisParaRetornoPosAfastamento,
+    );
+    const preferencialBloqueadoRetroCadastro = usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
       afastamentosPorUsuario,
       usuarioPreferencial,
       dataIso,
@@ -950,6 +1832,9 @@ async function recalcularEscalaInterno(
       dataIso,
       datasNaoUteisParaRetornoPosAfastamento,
     );
+    if (titularIndisponivelNoPlantao != null) {
+      preferencialIndisponivel = true;
+    }
     if (idsExcluirMesmoDia.has(Number(usuarioPreferencial))) {
       preferencialIndisponivel = true;
     }
@@ -967,6 +1852,18 @@ async function recalcularEscalaInterno(
       if (!ordemAtual.includes(uid)) continue;
       /** Em técnicos, evita re-enfileirar na vaga 1 quem já entrou na vaga 0 do mesmo dia. */
       if (idsExcluirMesmoDia.has(uid)) continue;
+      if (
+        recalculoPlenoNestePlantao &&
+        dataLimitePuloFocado &&
+        usuarioRetornoFeriasAbonoJaRealizadoAntesDe(
+          uid,
+          dataLimitePuloFocado,
+          retornosFeriasNoPrimeiroPlantao,
+          plantoes,
+        )
+      ) {
+        continue;
+      }
       if (!filaRetornosFeriasPendentes.includes(uid)) {
         filaRetornosFeriasPendentes.push(uid);
       }
@@ -985,6 +1882,7 @@ async function recalcularEscalaInterno(
       usuarioAlocado = retornoFeriasForcado;
       if (Number(usuarioAlocado) !== Number(usuarioPreferencial)) {
         ordemAtual = moverUsuarioAntesDeReferencia(ordemAtual, usuarioAlocado, usuarioPreferencial);
+        ordemGlobal = moverUsuarioAntesDeReferencia(ordemGlobal, usuarioAlocado, usuarioPreferencial);
       }
       idxOrdem = (ordemAtual.indexOf(usuarioAlocado) + 1) % ordemAtual.length;
     } else if (preferencialIndisponivel) {
@@ -1002,7 +1900,7 @@ async function recalcularEscalaInterno(
         let encontradoComGestaoAtestado = false;
         let afastamentosEncontrado = [];
         for (let passo = 1; passo <= ordemAtual.length; passo++) {
-          const candidato = ordemAtual[(idxPreferencial + passo) % ordemAtual.length];
+          const candidato = ordemAtual[(idxBaseBuscaSubstituto + passo) % ordemAtual.length];
           if (idsExcluirMesmoDia.has(Number(candidato))) continue;
           const afastamentosCandidato = afastamentosAtivosNoDia(afastamentosPorUsuario, candidato, dataIso);
           const candidatoBloqueadoPosFeriasOuAbono = usuarioBloqueadoPosFeriasOuAbonoNoDia(
@@ -1032,12 +1930,14 @@ async function recalcularEscalaInterno(
           observacaoPlantao = textoGestaoAtestadoMedico(afastamentosEncontrado, rotuloProfissional);
         }
         const deveAlterarOrdem =
-          afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) || preferencialBloqueadoPosFerias;
+          afastamentosPreferencial.some((af) => afastamentoDeveAdiarNoCiclo(af)) ||
+          preferencialBloqueadoPosFerias ||
+          preferencialBloqueadoRetroCadastro;
 
         if (deveAlterarOrdem) {
           ordemAtual = moverUsuarioDepoisDaCobertura(ordemAtual, usuarioPreferencial, usuarioAlocado);
           ordemGlobal = moverUsuarioDepoisDaCobertura(ordemGlobal, usuarioPreferencial, usuarioAlocado);
-          idxOrdem = (ordemAtual.indexOf(usuarioAlocado) + 1) % ordemAtual.length;
+          idxOrdem = (ordemAtual.indexOf(usuarioPreferencial) + 1) % ordemAtual.length;
         } else {
           idxOrdem = (idxPreferencial + 1) % ordemAtual.length;
         }
@@ -1073,6 +1973,24 @@ async function recalcularEscalaInterno(
     if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 0) {
       primeiroUsuarioNoDiaTech.set(dataIso, Number(usuarioAlocado));
     }
+  }
+
+  ordemAtualVet = normalizarOrdemRodizioCompleta(ordemAtualVet, ordemAtualDbInicialVet);
+  ordemAtualTec = normalizarOrdemRodizioCompleta(ordemAtualTec, ordemAtualDbInicialTec);
+  ordemGlobalVet = normalizarOrdemRodizioCompleta(ordemGlobalVet, ordemGlobalDbInicialVet);
+  ordemGlobalTec = normalizarOrdemRodizioCompleta(ordemGlobalTec, ordemGlobalDbInicialTec);
+
+  ordemAtualVet = rotacionarOrdemParaProximoPreferencial(ordemAtualVet, idxOrdemVet);
+  ordemAtualTec = rotacionarOrdemParaProximoPreferencial(ordemAtualTec, idxOrdemTec);
+  ordemGlobalVet = rotacionarOrdemParaProximoPreferencial(ordemGlobalVet, idxOrdemVet);
+  ordemGlobalTec = rotacionarOrdemParaProximoPreferencial(ordemGlobalTec, idxOrdemTec);
+
+  /** Mantém ordem global alinhada à fila do rodízio da escala quando esta mudou (ex.: 2º afastamento focalizado). */
+  if (ordemAtualVet.join(',') !== ordemGlobalVet.join(',')) {
+    ordemGlobalVet = [...ordemAtualVet];
+  }
+  if (ordemAtualTec.join(',') !== ordemGlobalTec.join(',')) {
+    ordemGlobalTec = [...ordemAtualTec];
   }
 
   const ordemMudouVet = ordemAtualVet.join(',') !== ordemAtualDbInicialVet.join(',');
@@ -2452,7 +3370,13 @@ const EscalaService = {
 
     const dataInicioStr = dataReferenciaParaStr(afastamento.dataInicio);
     const dataFimStr = dataReferenciaParaStr(afastamento.dataFim);
-    const resultado = await recalcularEscalasPorUsuarioPeriodoInterno(afastamento.usuarioId, dataInicioStr, dataFimStr, {
+    const afPlain = afastamento.get ? afastamento.get({ plain: true }) : afastamento;
+    let dataInicioRecalc = dataInicioStr;
+    if (afastamentoEhFerias(afPlain) || afastamentoEhAbono(afPlain)) {
+      const retroInicio = calcularDataInicioRetroCadastro(dataInicioStr, new Set());
+      if (retroInicio < dataInicioRecalc) dataInicioRecalc = retroInicio;
+    }
+    const resultado = await recalcularEscalasPorUsuarioPeriodoInterno(afastamento.usuarioId, dataInicioRecalc, dataFimStr, {
       transactionExterna,
       historicoMotivo: 'afastamento',
       historicoAfastamento: afastamento,
@@ -2831,8 +3755,26 @@ const EscalaService = {
 
 EscalaService.__testables = {
   escolherRetornoFeriasDoDia,
+  enfileirarRetornosFeriasDoDia,
   montarRetornosFeriasNoPrimeiroPlantao,
   usuarioIndisponivelParaPlantaoNoDia,
+  usuarioBloqueadoRetroCadastroFeriasAbonoNoDia,
+  calcularDataInicioRetroCadastro,
+  existeDiaUtilNoIntervalo,
+  adicionarDiasIso,
+  primeiroDiaMesSeguinte,
+  obterIdxRodizioAposUltimoPlantaoAntesDe,
+  usuarioRetornoFeriasAbonoJaRealizadoAntesDe,
+  sincronizarIdxOrdemDePlantoes,
+  plantaoRequerRecalculoFocado,
+  buscarProximoUsuarioDisponivelNoCiclo,
+  processarRetroativoFocadoEmLote,
+  corrigirCoberturaDuplicadaAposRetro,
+  normalizarOrdemRodizioCompleta,
+  aplicarOrdemInicialHistoricoRodizio,
+  afastamentoExigeRecalculoPlenoComHistoricoInicial,
+  rotacionarOrdemParaProximoPreferencial,
+  simularRodizioVetPlantoes,
 };
 
 module.exports = EscalaService;
