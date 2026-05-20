@@ -562,6 +562,36 @@ function calcularDataInicioRetroCadastro(inicioAfastamentoIso, datasNaoUteisIsoS
   return earliest;
 }
 
+/**
+ * Dia de plantão imediatamente antes do início sujeito à regra retroativa (o mais próximo do início).
+ * Ex.: abono segunda 22/06 → só 21/06 para corrigir titular errado, não 20/06 com Daniel.
+ */
+function ultimoDiaPlantaoRetroCadastroAntesInicio(
+  inicioAfastamentoIso,
+  usuarioId,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet = new Set(),
+) {
+  const inicio = String(inicioAfastamentoIso || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(inicio)) return null;
+  const limite = calcularDataInicioRetroCadastro(inicio, datasNaoUteisIsoSet);
+  let p = adicionarDiasIso(inicio, -1);
+  while (p >= limite) {
+    if (
+      usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+        afastamentosPorUsuario,
+        usuarioId,
+        p,
+        datasNaoUteisIsoSet,
+      )
+    ) {
+      return p;
+    }
+    p = adicionarDiasIso(p, -1);
+  }
+  return null;
+}
+
 function usuarioIndisponivelParaPlantaoNoDia(
   afastamentosPorUsuario,
   usuarioId,
@@ -591,12 +621,37 @@ function afastamentoDeveAdiarNoCiclo(af) {
  * - Férias/Abono: primeiro plantão após ter trabalhado ao menos 1 dia útil pós-fim;
  * - Atestado não entra (não força retorno no ciclo).
  */
-function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes, datasNaoUteisIsoSet = new Set()) {
+function montarLimitesRetornoPorDataECategoria(plantoes) {
+  const limites = new Map();
+  for (const p of plantoes) {
+    const ds = dataReferenciaParaStr(p.dataReferencia ?? p.dataIso);
+    if (!ds) continue;
+    const cat = categoriaPlantaoDe(p) || CATEGORIA_PLANTAO.VETERINARIO;
+    const key = `${ds}|${cat}`;
+    limites.set(key, (limites.get(key) || 0) + 1);
+  }
+  return limites;
+}
+
+function categoriaUsuarioParaRetornoFerias(usuarioId, categoriaPorUsuarioId) {
+  const uid = Number(usuarioId);
+  if (categoriaPorUsuarioId?.has(uid)) return categoriaPorUsuarioId.get(uid);
+  return CATEGORIA_PLANTAO.VETERINARIO;
+}
+
+function montarRetornosFeriasNoPrimeiroPlantao(
+  afastamentos,
+  plantoes,
+  datasNaoUteisIsoSet = new Set(),
+  categoriaPorUsuarioId = null,
+) {
   const mapa = new Map();
   if (!Array.isArray(afastamentos) || !Array.isArray(plantoes) || plantoes.length === 0) {
     return mapa;
   }
-  const datasPlantoes = [...new Set(plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia)))].sort();
+  const limitesPorDataCategoria = montarLimitesRetornoPorDataECategoria(plantoes);
+  const datasPlantoes = [...new Set(plantoes.map((p) => dataReferenciaParaStr(p.dataReferencia ?? p.dataIso)))].sort();
+  const candidatos = [];
   for (const af of afastamentos) {
     const ehFerias = afastamentoEhFerias(af);
     const ehAbono = afastamentoEhAbono(af);
@@ -610,13 +665,117 @@ function montarRetornosFeriasNoPrimeiroPlantao(afastamentos, plantoes, datasNaoU
       (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds, datasNaoUteisIsoSet),
     );
     if (!primeiraDataPosRetorno) continue;
-    const atual = mapa.get(primeiraDataPosRetorno) || [];
-    if (!atual.includes(usuarioId)) {
-      atual.push(usuarioId);
-      mapa.set(primeiraDataPosRetorno, atual);
+    candidatos.push({
+      usuarioId,
+      primeiraDataPosRetorno,
+      fimIso,
+      ehFerias,
+      ehAbono,
+    });
+  }
+  candidatos.sort((a, b) => {
+    const cmpData = a.primeiraDataPosRetorno.localeCompare(b.primeiraDataPosRetorno);
+    if (cmpData !== 0) return cmpData;
+    const cmpFim = a.fimIso.localeCompare(b.fimIso);
+    if (cmpFim !== 0) return cmpFim;
+    if (a.ehFerias !== b.ehFerias) return a.ehFerias ? -1 : 1;
+    return a.ehAbono ? -1 : 1;
+  });
+  /**
+   * Mesmo dia de retorno:
+   * - Férias + férias (ex.: Ana 19 e Gabriela 25 → 27): escalona (1 vaga/dia).
+   * - Férias + abono no mesmo dia: mantém os dois no mapa; a fila/escolherRetorno prioriza férias
+   *   e o abono retorna no plantão seguinte (ex.: A27 + G28).
+   */
+  for (const c of candidatos) {
+    const catUsuario = categoriaUsuarioParaRetornoFerias(c.usuarioId, categoriaPorUsuarioId);
+    let dataAloc = c.primeiraDataPosRetorno;
+    while (dataAloc) {
+      const ocupados = mapa.get(dataAloc) || [];
+      if (ocupados.includes(c.usuarioId)) break;
+      const limite =
+        limitesPorDataCategoria.get(`${dataAloc}|${catUsuario}`) ||
+        limitesPorDataCategoria.get(`${dataAloc}|${CATEGORIA_PLANTAO.VETERINARIO}`) ||
+        1;
+      const ocupadosMesmaCategoria = ocupados.filter(
+        (uid) => categoriaUsuarioParaRetornoFerias(uid, categoriaPorUsuarioId) === catUsuario,
+      );
+      const candidatoPorUsuario = new Map(candidatos.map((x) => [x.usuarioId, x]));
+      const todosConflitoSaoFerias = [...ocupadosMesmaCategoria, c.usuarioId].every(
+        (uid) => candidatoPorUsuario.get(uid)?.ehFerias,
+      );
+      if (ocupadosMesmaCategoria.length < limite || !todosConflitoSaoFerias) {
+        mapa.set(dataAloc, [...ocupados, c.usuarioId]);
+        break;
+      }
+      const idx = datasPlantoes.indexOf(dataAloc);
+      dataAloc = idx >= 0 && idx + 1 < datasPlantoes.length ? datasPlantoes[idx + 1] : null;
     }
   }
   return mapa;
+}
+
+/** Primeira data de plantão após o fim do afastamento em que já houve dia útil (retorno no ciclo). */
+function dataPlantaoRetornoUsuarioNoMapa(retornosFeriasNoPrimeiroPlantao, usuarioId) {
+  if (!retornosFeriasNoPrimeiroPlantao) return null;
+  const uid = Number(usuarioId);
+  for (const [dataIso, uids] of retornosFeriasNoPrimeiroPlantao.entries()) {
+    if ((uids || []).some((u) => Number(u) === uid)) return dataIso;
+  }
+  return null;
+}
+
+function dataPlantaoRetornoUsuario(
+  retornosFeriasNoPrimeiroPlantao,
+  af,
+  datasPlantoesOrdenadas,
+  datasNaoUteisIsoSet = new Set(),
+) {
+  const noMapa = dataPlantaoRetornoUsuarioNoMapa(retornosFeriasNoPrimeiroPlantao, af.usuarioId);
+  if (noMapa) return noMapa;
+  return primeiraDataPlantaoRetornoPosFeriasOuAbono(af, datasPlantoesOrdenadas, datasNaoUteisIsoSet);
+}
+
+function primeiraDataPlantaoRetornoPosFeriasOuAbono(af, datasPlantoesOrdenadas, datasNaoUteisIsoSet = new Set()) {
+  const ehFerias = afastamentoEhFerias(af);
+  const ehAbono = afastamentoEhAbono(af);
+  if (!ehFerias && !ehAbono) return null;
+  const fimIso = dataReferenciaParaStr(af.dataFim);
+  if (!fimIso || !Array.isArray(datasPlantoesOrdenadas) || datasPlantoesOrdenadas.length === 0) {
+    return null;
+  }
+  const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
+  return (
+    datasPlantoesOrdenadas.find(
+      (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds, datasNaoUteisIsoSet),
+    ) || null
+  );
+}
+
+function dataFimMaisAntigoRetornoUsuario(afastamentosPorUsuario, usuarioId) {
+  const lista = afastamentosPorUsuario.get(Number(usuarioId)) || [];
+  let melhorFim = null;
+  for (const af of lista) {
+    if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) continue;
+    const fimIso = dataReferenciaParaStr(af.dataFim);
+    if (!fimIso) continue;
+    if (!melhorFim || fimIso < melhorFim) melhorFim = fimIso;
+  }
+  return melhorFim;
+}
+
+/** Menor = maior prioridade no retorno do dia (férias antes de abono). */
+function prioridadeRetornoCicloUsuario(afastamentosPorUsuario, usuarioId, dataIso) {
+  const lista = afastamentosPorUsuario.get(Number(usuarioId)) || [];
+  let melhor = 99;
+  for (const af of lista) {
+    if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) continue;
+    const fimIso = dataReferenciaParaStr(af.dataFim);
+    if (!fimIso || !(dataIso > fimIso)) continue;
+    const p = afastamentoEhFerias(af) ? 0 : 1;
+    if (p < melhor) melhor = p;
+  }
+  return melhor;
 }
 
 function escolherRetornoFeriasDoDia(
@@ -632,6 +791,7 @@ function escolherRetornoFeriasDoDia(
     return null;
   }
   let escolhido = null;
+  let melhorPrioridade = Number.MAX_SAFE_INTEGER;
   let menorDistancia = Number.MAX_SAFE_INTEGER;
   for (const uidRaw of retornosHoje) {
     const uid = Number(uidRaw);
@@ -639,8 +799,18 @@ function escolherRetornoFeriasDoDia(
     const idx = ordemAtual.indexOf(uid);
     if (idx < 0) continue;
     if (usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet)) continue;
+    const prioridade = prioridadeRetornoCicloUsuario(afastamentosPorUsuario, uid, dataIso);
     const distancia = (idx - idxPreferencial + ordemAtual.length) % ordemAtual.length;
-    if (distancia < menorDistancia) {
+    const fimRetorno = dataFimMaisAntigoRetornoUsuario(afastamentosPorUsuario, uid);
+    if (
+      prioridade < melhorPrioridade ||
+      (prioridade === melhorPrioridade &&
+        fimRetorno &&
+        escolhido != null &&
+        fimRetorno.localeCompare(dataFimMaisAntigoRetornoUsuario(afastamentosPorUsuario, escolhido) || '') < 0) ||
+      (prioridade === melhorPrioridade && distancia < menorDistancia)
+    ) {
+      melhorPrioridade = prioridade;
       menorDistancia = distancia;
       escolhido = uid;
     }
@@ -801,10 +971,9 @@ async function atualizarOrdemServidoresGlobalSemColisao(ordemUsuarioIds, transac
  * Ajusta o índice do rodízio com base nos plantões já gravados antes de `dataLimiteIso`.
  */
 /**
- * Em recálculo com afastamentos anteriores na escala: só reprocessa plantões do servidor
- * do afastamento atual (retroativo, período ativo, retorno). Demais datas mantêm a BD.
+ * Técnicos — recálculo focalizado (AABB, 2º/3º abono, retorno do par no dia de retorno).
  */
-function plantaoRequerRecalculoFocado(
+function plantaoRequerRecalculoFocadoTec(
   usuarioAfetadoId,
   plantao,
   dataIso,
@@ -817,18 +986,15 @@ function plantaoRequerRecalculoFocado(
 ) {
   const uid = Number(usuarioAfetadoId);
   if (!Number.isFinite(uid) || uid < 1 || !ordemAtual?.length) return false;
+  if (categoriaPlantaoDe(plantao) !== CATEGORIA_PLANTAO.TECNICO) return false;
   /**
-   * Abono focalizado do técnico: após o fim, re-simula só quando necessário.
+   * Abono focalizado: após o fim, re-simula só quando necessário.
    * - 2º abono (ex.: Diego após férias Álvaro): todo plantão > fim — o ciclo perdeu a vez do servidor.
    * - 3º+ abono (ex.: Fábio): só plantões em que ele é titular — evita estragar 28/06 já correto (HH).
    */
   if (historicoAfastamento) {
     const af = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
-    if (
-      afastamentoEhAbono(af) &&
-      categoriaPlantaoDe(plantao) === CATEGORIA_PLANTAO.TECNICO &&
-      ordemAtual.includes(uid)
-    ) {
+    if (afastamentoEhAbono(af) && ordemAtual.includes(uid)) {
       const fimIso = dataReferenciaParaStr(af.dataFim);
       if (fimIso && dataIso > fimIso) {
         if (Number(plantao.usuarioId) === uid) return true;
@@ -840,10 +1006,108 @@ function plantaoRequerRecalculoFocado(
     }
   }
   const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
-  /** Retorno no 1º plantão após dia útil: recalcula o dia inteiro (ex.: Fábio no 27 troca com Gustavo). */
   if (retornosHoje.some((u) => Number(u) === uid)) return true;
   if (Number(plantao.usuarioId) !== uid) return false;
   return usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet);
+}
+
+/**
+ * Veterinários — recálculo focalizado (1 vaga/dia).
+ * Abono sem abono anterior na escala: onda entre fim e 1º retorno (Daniel 12 → E13 F14).
+ * Com abono anterior (ex.: Gabriela após Daniel): só titular, dia de retorno e plantão seguinte
+ * (evita reabrir 13–20; garante 28 quando retorno em 27 foi da Ana — A27 G28).
+ */
+function plantaoRequerRecalculoFocadoVet(
+  usuarioAfetadoId,
+  plantao,
+  dataIso,
+  ordemAtual,
+  retornosFeriasNoPrimeiroPlantao,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet,
+  historicoAfastamento = null,
+  datasPlantoesOrdenadas = null,
+  outrosAfastamentosNaEscala = [],
+) {
+  const uid = Number(usuarioAfetadoId);
+  if (!Number.isFinite(uid) || uid < 1 || !ordemAtual?.length) return false;
+  if (categoriaPlantaoDe(plantao) !== CATEGORIA_PLANTAO.VETERINARIO) return false;
+
+  if (historicoAfastamento) {
+    const af = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
+    const afUid = Number(af.usuarioId);
+    if (Number(afUid) === uid && ordemAtual.includes(uid) && (afastamentoEhAbono(af) || afastamentoEhFerias(af))) {
+      const fimIso = dataReferenciaParaStr(af.dataFim);
+      if (fimIso && dataIso > fimIso) {
+        const datasRef = Array.isArray(datasPlantoesOrdenadas) ? datasPlantoesOrdenadas : [];
+        const primeiraRetorno = dataPlantaoRetornoUsuario(
+          retornosFeriasNoPrimeiroPlantao,
+          af,
+          datasRef,
+          datasNaoUteisIsoSet,
+        );
+        const temAfastamentoAnteriorNaEscala = (outrosAfastamentosNaEscala || []).length > 0;
+        const temAbonoAnteriorNaEscala = (outrosAfastamentosNaEscala || []).some((a) => afastamentoEhAbono(a));
+        if (afastamentoEhAbono(af) && !temAbonoAnteriorNaEscala) {
+          if (primeiraRetorno && dataIso < primeiraRetorno) return true;
+        } else if (temAfastamentoAnteriorNaEscala && primeiraRetorno) {
+          if (Number(plantao.usuarioId) === uid) return true;
+          if (dataIso === primeiraRetorno) return true;
+          const idxRet = datasRef.indexOf(primeiraRetorno);
+          if (idxRet >= 0 && datasRef[idxRet + 1] === dataIso) return true;
+        } else if (afastamentoEhFerias(af) && !temAfastamentoAnteriorNaEscala) {
+          if (primeiraRetorno && dataIso < primeiraRetorno) return true;
+        }
+      }
+    }
+  }
+
+  const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
+  if (retornosHoje.some((u) => Number(u) === uid)) return true;
+  if (Number(plantao.usuarioId) !== uid) return false;
+  return usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet);
+}
+
+/**
+ * Em recálculo com afastamentos anteriores na escala: despacha por categoria (vet/téc).
+ */
+function plantaoRequerRecalculoFocado(
+  usuarioAfetadoId,
+  plantao,
+  dataIso,
+  ordemAtual,
+  retornosFeriasNoPrimeiroPlantao,
+  afastamentosPorUsuario,
+  datasNaoUteisIsoSet,
+  historicoAfastamento = null,
+  outrosAfastamentosNaEscala = [],
+  datasPlantoesOrdenadas = null,
+) {
+  if (categoriaPlantaoDe(plantao) === CATEGORIA_PLANTAO.TECNICO) {
+    return plantaoRequerRecalculoFocadoTec(
+      usuarioAfetadoId,
+      plantao,
+      dataIso,
+      ordemAtual,
+      retornosFeriasNoPrimeiroPlantao,
+      afastamentosPorUsuario,
+      datasNaoUteisIsoSet,
+      historicoAfastamento,
+      outrosAfastamentosNaEscala,
+    );
+  }
+  return plantaoRequerRecalculoFocadoVet(
+    usuarioAfetadoId,
+    plantao,
+    dataIso,
+    ordemAtual,
+    retornosFeriasNoPrimeiroPlantao,
+    afastamentosPorUsuario,
+    datasNaoUteisIsoSet,
+    historicoAfastamento,
+    datasPlantoesOrdenadas,
+    outrosAfastamentosNaEscala,
+  );
 }
 
 function buscarProximoUsuarioDisponivelNoCiclo(
@@ -906,14 +1170,34 @@ async function processarRetroativoFocadoEmLote({
   let idxBusca = Number(idxInicial) || 0;
   let ultimaDataRetro = '';
   let ultimoSubstituto = null;
+  const ultimoDiaRetroVetAntesInicio =
+    categoriaPlantaoAlvo === CATEGORIA_PLANTAO.VETERINARIO
+      ? ultimoDiaPlantaoRetroCadastroAntesInicio(
+          inicioAfastamentoIso,
+          uid,
+          afastamentosPorUsuario,
+          datasNaoUteisIsoSet,
+        )
+      : null;
 
   const plantoesRetro = plantoes
     .filter((p) => {
       if (categoriaPlantaoDe(p) !== categoriaPlantaoAlvo) return false;
       const ds = dataReferenciaParaStr(p.dataReferencia);
       if (!ds || ds >= inicioAfastamentoIso) return false;
-      if (Number(p.usuarioId) !== uid) return false;
-      return usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(afastamentosPorUsuario, uid, ds, datasNaoUteisIsoSet);
+      if (!usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(afastamentosPorUsuario, uid, ds, datasNaoUteisIsoSet)) {
+        return false;
+      }
+      if (categoriaPlantaoAlvo === CATEGORIA_PLANTAO.VETERINARIO) {
+        /**
+         * Só o titular afetado ou o último fim de semana antes do início (ex.: 21, não 20 com Daniel).
+         * Evita trocar D20 por E20 ao cadastrar abono da Gabriela na segunda 22/06.
+         */
+        if (Number(p.usuarioId) === uid) return true;
+        if (ultimoDiaRetroVetAntesInicio && ds === ultimoDiaRetroVetAntesInicio) return true;
+        return false;
+      }
+      return Number(p.usuarioId) === uid;
     })
     .sort((a, b) => dataReferenciaParaStr(a.dataReferencia).localeCompare(dataReferenciaParaStr(b.dataReferencia)));
 
@@ -922,13 +1206,25 @@ async function processarRetroativoFocadoEmLote({
     const posTitular = ordem.indexOf(uid);
     const retroTitular =
       !!inicioAfastamentoIso && dataIso < inicioAfastamentoIso && posTitular >= 0;
-    const idxParaBusca = retroTitular
-      ? idxBusca % ordem.length
-      : ultimaDataRetro && dataIso > ultimaDataRetro
-        ? idxBusca
-        : posTitular >= 0
-          ? posTitular
-          : idxBusca;
+    const primeiroRetroDoLote = retroTitular && !ultimaDataRetro;
+    const posGravado = ordem.indexOf(Number(plantao.usuarioId));
+    let idxParaBusca;
+    if (
+      categoriaPlantaoAlvo === CATEGORIA_PLANTAO.VETERINARIO &&
+      Number(plantao.usuarioId) !== uid &&
+      posGravado >= 0
+    ) {
+      /** Plantão com outro nome na BD: substituto segue a partir de quem está gravado (ex.: 21 com G → H). */
+      idxParaBusca = posGravado;
+    } else if (primeiroRetroDoLote) {
+      idxParaBusca = posTitular >= 0 ? posTitular : idxBusca % ordem.length;
+    } else if (retroTitular) {
+      idxParaBusca = idxBusca % ordem.length;
+    } else if (ultimaDataRetro && dataIso > ultimaDataRetro) {
+      idxParaBusca = idxBusca;
+    } else {
+      idxParaBusca = posTitular >= 0 ? posTitular : idxBusca;
+    }
     const idsExcluirMesmoDia = new Set();
     if (categoriaPlantaoAlvo === CATEGORIA_PLANTAO.TECNICO) {
       for (const p of plantoes) {
@@ -1220,6 +1516,28 @@ function alocarParTecDiaRetornoAbonoFocalizado({
   };
 }
 
+/** Veterinário: mesmo titular no fim de semana anterior (ex.: D20 e D21 após pular retorno de Daniel no 20). */
+function plantaoVetMesmaPessoaNoFimDeSemanaAnterior(plantoes, plantao) {
+  if (categoriaPlantaoDe(plantao) !== CATEGORIA_PLANTAO.VETERINARIO) return false;
+  const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+  const uid = Number(plantao.usuarioId);
+  if (!dataIso || !Number.isFinite(uid) || uid < 1 || !Array.isArray(plantoes)) return false;
+  let dataAnterior = null;
+  for (const p of plantoes) {
+    if (categoriaPlantaoDe(p) !== CATEGORIA_PLANTAO.VETERINARIO) continue;
+    const ds = dataReferenciaParaStr(p.dataReferencia);
+    if (!ds || ds >= dataIso) continue;
+    if (!dataAnterior || ds > dataAnterior) dataAnterior = ds;
+  }
+  if (!dataAnterior) return false;
+  const plantaoAnterior = plantoes.find(
+    (p) =>
+      categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+      dataReferenciaParaStr(p.dataReferencia) === dataAnterior,
+  );
+  return plantaoAnterior != null && Number(plantaoAnterior.usuarioId) === uid;
+}
+
 function avancarIdxOrdemAPartirDoPlantao(plantao, ordemAtual, catPlantao, idxState) {
   const uid = Number(plantao.usuarioId);
   if (!ordemAtual.length || !Number.isFinite(uid) || uid < 1) return;
@@ -1454,18 +1772,19 @@ function simularRodizioVetPlantoes(ordemInicial, datasPlantaoIso, afastamentosFl
         filaRetornosFeriasPendentes.push(uid);
       }
     }
-    const retornoFeriasForcado =
-      retornosHoje.length > 0
-        ? escolherRetornoFeriasDoDia(
-            filaRetornosFeriasPendentes,
-            ordemAtual,
-            idxPreferencial,
-            afastamentosPorUsuario,
-            dataIso,
-            datasNaoUteisIsoSet,
-            new Set(),
-          )
-        : null;
+    const temRetornoFeriasPendente =
+      retornosHoje.length > 0 || filaRetornosFeriasPendentes.length > 0;
+    const retornoFeriasForcado = temRetornoFeriasPendente
+      ? escolherRetornoFeriasDoDia(
+          filaRetornosFeriasPendentes,
+          ordemAtual,
+          idxPreferencial,
+          afastamentosPorUsuario,
+          dataIso,
+          datasNaoUteisIsoSet,
+          new Set(),
+        )
+      : null;
 
     if (retornoFeriasForcado != null) {
       usuarioAlocado = retornoFeriasForcado;
@@ -1557,10 +1876,14 @@ function simularRodizioTecPlantoes(
     Array.isArray(plantoesReferenciaRetorno) && plantoesReferenciaRetorno.length > 0
       ? plantoesReferenciaRetorno
       : plantoes;
+  const categoriaPorUsuarioIdTec = new Map(
+    (ordemInicial || []).map((id) => [Number(id), CATEGORIA_PLANTAO.TECNICO]),
+  );
   const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
     afastamentosFlat,
     plantoesParaRetorno,
     datasNaoUteisIsoSet,
+    categoriaPorUsuarioIdTec,
   );
   const filaRetornosFeriasPendentes = [];
   const primeiroUsuarioNoDiaTech = new Map();
@@ -1624,18 +1947,19 @@ function simularRodizioTecPlantoes(
       }
       if (!filaRetornosFeriasPendentes.includes(uid)) filaRetornosFeriasPendentes.push(uid);
     }
-    const retornoFeriasForcado =
-      retornosHoje.length > 0
-        ? escolherRetornoFeriasDoDia(
-            filaRetornosFeriasPendentes,
-            ordemAtual,
-            idxPreferencial,
-            afastamentosPorUsuario,
-            dataIso,
-            datasNaoUteisIsoSet,
-            idsExcluirMesmoDia,
-          )
-        : null;
+    const temRetornoFeriasPendente =
+      retornosHoje.length > 0 || filaRetornosFeriasPendentes.length > 0;
+    const retornoFeriasForcado = temRetornoFeriasPendente
+      ? escolherRetornoFeriasDoDia(
+          filaRetornosFeriasPendentes,
+          ordemAtual,
+          idxPreferencial,
+          afastamentosPorUsuario,
+          dataIso,
+          datasNaoUteisIsoSet,
+          idsExcluirMesmoDia,
+        )
+      : null;
 
     if (retornoFeriasForcado != null && !idsExcluirMesmoDia.has(Number(retornoFeriasForcado))) {
       usuarioAlocado = retornoFeriasForcado;
@@ -1745,6 +2069,119 @@ function derivarOrdemTecRodizioConsistenteComPlantoes({
 }
 
 /**
+ * Reconstrói a fila de veterinários a partir do calendário gravado (mesma ideia do técnico:
+ * plantões + afastamentos → fila interna + rotação para o próximo plantão).
+ */
+function derivarOrdemVetRodizioConsistenteComPlantoes({
+  plantoes,
+  ordemBase,
+  afastamentosLista,
+  datasNaoUteisIsoSet = new Set(),
+  /**
+   * `rotacionar`: mantém a fila do loop focalizado e só alinha o próximo da fila ao calendário gravado.
+   * `replay`: reconstrói a fila a partir do calendário (1º abono na escala, ex.: Daniel).
+   */
+  modo = 'replay',
+  /** Ex.: `2026-07-01` no abono focalizado de junho — igual ao recálculo pleno do mês seguinte. */
+  dataLimiteRotacaoIso = null,
+}) {
+  const ordemInicial = normalizarOrdemRodizioCompleta(ordemBase, ordemBase);
+  if (!ordemInicial.length) {
+    return { ordemAtual: [], ordemPersistida: [], idxOrdem: 0 };
+  }
+  const plantoesVetTodos = (plantoes || [])
+    .filter((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO)
+    .sort((a, b) => {
+      const cmp = dataReferenciaParaStr(a.dataReferencia).localeCompare(dataReferenciaParaStr(b.dataReferencia));
+      if (cmp !== 0) return cmp;
+      return Number(a.vagaIndice ?? 0) - Number(b.vagaIndice ?? 0);
+    });
+  /** Só junho na fila interna; julho vem do espelho do mês anterior (evita BCDEFHAG e fila errada). */
+  const plantoesVet = dataLimiteRotacaoIso
+    ? plantoesVetTodos.filter((p) => dataReferenciaParaStr(p.dataReferencia) < dataLimiteRotacaoIso)
+    : plantoesVetTodos;
+  const datasVet = [
+    ...new Set(plantoesVet.map((p) => dataReferenciaParaStr(p.dataReferencia)).filter(Boolean)),
+  ].sort();
+  const limiteRotacao =
+    dataLimiteRotacaoIso ||
+    (datasVet.length > 0 ? adicionarDiasIso(datasVet[datasVet.length - 1], 1) : null);
+  if (modo === 'rotacionar' && limiteRotacao) {
+    const idxFim = obterIdxRodizioAposUltimoPlantaoAntesDe(
+      plantoesVet,
+      ordemInicial,
+      limiteRotacao,
+      CATEGORIA_PLANTAO.VETERINARIO,
+    );
+    const ordemPersistida = rotacionarOrdemParaProximoPreferencial(ordemInicial, idxFim);
+    return { ordemAtual: ordemInicial, ordemPersistida, idxOrdem: idxFim };
+  }
+  const afFlat = (afastamentosLista || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+  const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
+    afFlat,
+    plantoesVet.map((p) => ({ dataReferencia: dataReferenciaParaStr(p.dataReferencia) })),
+    datasNaoUteisIsoSet,
+  );
+  let ordemAtual = [...ordemInicial];
+  let idxOrdem = 0;
+  for (const plantao of plantoesVet) {
+    const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
+    const alocado = Number(plantao.usuarioId);
+    if (!dataIso || !Number.isFinite(alocado) || alocado < 1) continue;
+    const idxPref = idxOrdem % ordemAtual.length;
+    const preferencial = ordemAtual[idxPref];
+    const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
+    const alocadoEhRetorno = retornosHoje.some((u) => Number(u) === alocado);
+    if (
+      alocado !== preferencial &&
+      ordemAtual.includes(alocado) &&
+      (preferencial == null || ordemAtual.includes(preferencial))
+    ) {
+      if (alocadoEhRetorno && preferencial != null) {
+        ordemAtual = moverUsuarioAntesDeReferencia(ordemAtual, alocado, preferencial);
+      } else if (preferencial != null) {
+        ordemAtual = moverUsuarioDepoisDaCobertura(ordemAtual, preferencial, alocado);
+      }
+    }
+    const pos = ordemAtual.indexOf(alocado);
+    idxOrdem = pos >= 0 ? (pos + 1) % ordemAtual.length : (idxPref + 1) % ordemAtual.length;
+  }
+  const ordemNormalizada = normalizarOrdemRodizioCompleta(ordemAtual, ordemInicial);
+  const n = ordemNormalizada.length;
+  let idxFim = 0;
+  if (limiteRotacao && n > 0) {
+    idxFim = obterIdxRodizioAposUltimoPlantaoAntesDe(
+      plantoesVet,
+      ordemNormalizada,
+      limiteRotacao,
+      CATEGORIA_PLANTAO.VETERINARIO,
+    );
+    /**
+     * Ex.: A no 27 (retorno) e G no 28 — na fila interna G e A podem não ser adjacentes;
+     * o próximo plantão (julho) segue o penúltimo fim de semana (Ana), não (pos(G)+1).
+     */
+    if (plantoesVet.length >= 2) {
+      const uPen = Number(plantoesVet[plantoesVet.length - 2].usuarioId);
+      const uUlt = Number(plantoesVet[plantoesVet.length - 1].usuarioId);
+      const iUlt = ordemNormalizada.indexOf(uUlt);
+      const iPen = ordemNormalizada.indexOf(uPen);
+      if (
+        Number.isFinite(uPen) &&
+        Number.isFinite(uUlt) &&
+        uPen !== uUlt &&
+        iPen >= 0 &&
+        iUlt >= 0 &&
+        (iUlt + 1) % n !== iPen
+      ) {
+        idxFim = iPen;
+      }
+    }
+  }
+  const ordemPersistida = rotacionarOrdemParaProximoPreferencial(ordemNormalizada, idxFim);
+  return { ordemAtual: ordemNormalizada, ordemPersistida, idxOrdem: idxFim };
+}
+
+/**
  * Re-simula plantões de técnico com data > fim do abono (mesma lógica do recálculo pleno).
  * Evita índice desalinhado entre dias consecutivos no loop focalizado (ex.: 27 → 28).
  */
@@ -1836,6 +2273,85 @@ function espelharPlantoesTecMesSeguintePeloMesAnterior({ plantoes, dataLimiteIso
 async function espelharPlantoesTecMesSeguinteFocado(opts) {
   const { transaction, ...memOpts } = opts;
   const res = espelharPlantoesTecMesSeguintePeloMesAnterior(memOpts);
+  if (transaction) {
+    for (const plantao of opts.plantoes) {
+      if (!res.idsProcessados.has(Number(plantao.id))) continue;
+      if (typeof plantao.save === 'function') {
+        await plantao.save({ transaction });
+      }
+    }
+  }
+  return res;
+}
+
+/**
+ * Veterinário (1 vaga/dia): julho repete o 1º, 2º, … fim de semana de junho (mesma lógica do técnico).
+ */
+function espelharPlantoesVetMesSeguintePeloMesAnterior({ plantoes, dataLimiteIso }) {
+  const mesAnterior = mesIsoAnteriorDeDataLimite(dataLimiteIso);
+  if (!mesAnterior || !dataLimiteIso) {
+    return { idsProcessados: new Set(), atualizados: 0 };
+  }
+  const datasMesAnterior = [
+    ...new Set(
+      plantoes
+        .filter((p) => {
+          const ds = dataReferenciaParaStr(p.dataReferencia);
+          return (
+            categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+            ds &&
+            mesIsoDeDataReferencia(ds) === mesAnterior
+          );
+        })
+        .map((p) => dataReferenciaParaStr(p.dataReferencia)),
+    ),
+  ].sort();
+  const datasMesSeguinte = [
+    ...new Set(
+      plantoes
+        .filter((p) => {
+          const ds = dataReferenciaParaStr(p.dataReferencia);
+          return (
+            categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+            ds &&
+            ds >= dataLimiteIso
+          );
+        })
+        .map((p) => dataReferenciaParaStr(p.dataReferencia)),
+    ),
+  ].sort();
+  const idsProcessados = new Set();
+  let atualizados = 0;
+  const n = Math.min(datasMesAnterior.length, datasMesSeguinte.length);
+  for (let i = 0; i < n; i++) {
+    const dsJun = datasMesAnterior[i];
+    const dsJul = datasMesSeguinte[i];
+    const plJun = plantoes.find(
+      (p) =>
+        categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+        dataReferenciaParaStr(p.dataReferencia) === dsJun,
+    );
+    const plJul = plantoes.find(
+      (p) =>
+        categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+        dataReferenciaParaStr(p.dataReferencia) === dsJul,
+    );
+    if (!plJun || !plJul) continue;
+    const uidJun = Number(plJun.usuarioId);
+    if (!Number.isFinite(uidJun) || uidJun < 1) continue;
+    if (Number(plJul.usuarioId) !== uidJun) {
+      plJul.usuarioId = uidJun;
+      plJul.observacao = null;
+      atualizados += 1;
+    }
+    idsProcessados.add(Number(plJul.id));
+  }
+  return { idsProcessados, atualizados };
+}
+
+async function espelharPlantoesVetMesSeguinteFocado(opts) {
+  const { transaction, ...memOpts } = opts;
+  const res = espelharPlantoesVetMesSeguintePeloMesAnterior(memOpts);
   if (transaction) {
     for (const plantao of opts.plantoes) {
       if (!res.idsProcessados.has(Number(plantao.id))) continue;
@@ -2071,10 +2587,14 @@ function simularRodizioTecModoFocado({
     if (cmp !== 0) return cmp;
     return Number(a.vagaIndice) - Number(b.vagaIndice);
   });
+  const categoriaPorUsuarioIdTecFoc = new Map(
+    (ordemInicial || []).map((id) => [Number(id), CATEGORIA_PLANTAO.TECNICO]),
+  );
   const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
     afastamentosFlat,
     plantoes,
     datasNaoUteisIsoSet,
+    categoriaPorUsuarioIdTecFoc,
   );
   const filaRetornosFeriasPendentes = [];
   const primeiroUsuarioNoDiaTech = new Map();
@@ -2295,18 +2815,19 @@ function simularRodizioTecModoFocado({
       if (idsExcluirMesmoDia.has(uidRet)) continue;
       if (!filaRetornosFeriasPendentes.includes(uidRet)) filaRetornosFeriasPendentes.push(uidRet);
     }
-    const retornoFeriasForcado =
-      retornosHoje.length > 0
-        ? escolherRetornoFeriasDoDia(
-            filaRetornosFeriasPendentes,
-            ordemAtualTec,
-            idxPreferencial,
-            afastamentosPorUsuario,
-            dataIso,
-            datasNaoUteisIsoSet,
-            idsExcluirMesmoDia,
-          )
-        : null;
+    const temRetornoFeriasPendente =
+      retornosHoje.length > 0 || filaRetornosFeriasPendentes.length > 0;
+    const retornoFeriasForcado = temRetornoFeriasPendente
+      ? escolherRetornoFeriasDoDia(
+          filaRetornosFeriasPendentes,
+          ordemAtualTec,
+          idxPreferencial,
+          afastamentosPorUsuario,
+          dataIso,
+          datasNaoUteisIsoSet,
+          idsExcluirMesmoDia,
+        )
+      : null;
 
     if (retornoFeriasForcado != null && !idsExcluirMesmoDia.has(Number(retornoFeriasForcado))) {
       usuarioAlocado = retornoFeriasForcado;
@@ -2685,11 +3206,27 @@ async function recalcularEscalaInterno(
             .filter((ds) => !!ds && !ehFimDeSemanaDataReferencia(ds)),
         )
       : new Set();
+  const categoriaPorUsuarioIdRetorno = new Map();
+  for (const id of ordemAtualVet) {
+    categoriaPorUsuarioIdRetorno.set(Number(id), CATEGORIA_PLANTAO.VETERINARIO);
+  }
+  for (const id of ordemAtualTec) {
+    categoriaPorUsuarioIdRetorno.set(Number(id), CATEGORIA_PLANTAO.TECNICO);
+  }
   const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
     afastamentos,
     plantoes,
     datasNaoUteisParaRetornoPosAfastamento,
+    categoriaPorUsuarioIdRetorno,
   );
+  const datasPlantoesVetOrdenadas = [
+    ...new Set(
+      plantoes
+        .filter((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO)
+        .map((p) => dataReferenciaParaStr(p.dataReferencia))
+        .filter(Boolean),
+    ),
+  ].sort();
   /** Retornos de férias já vencidos e ainda não alocados (empates no mesmo dia, indisponibilidade etc.). */
   const filaRetornosFeriasPendentes = [];
 
@@ -2766,6 +3303,7 @@ async function recalcularEscalaInterno(
           datasNaoUteisParaRetornoPosAfastamento,
           historicoAfastamento,
           outrosAfastamentosFocado,
+          datasPlantoesVetOrdenadas,
         );
       })
       .map((p) => dataReferenciaParaStr(p.dataReferencia))
@@ -2867,6 +3405,13 @@ async function recalcularEscalaInterno(
       });
       for (const id of resEspelho.idsProcessados) plantaoIdsMesSeguinteLote.add(id);
       atualizados += resEspelho.atualizados;
+      const resEspelhoVet = await espelharPlantoesVetMesSeguinteFocado({
+        plantoes,
+        dataLimiteIso: dataLimitePuloFocado,
+        transaction,
+      });
+      for (const id of resEspelhoVet.idsProcessados) plantaoIdsMesSeguinteLote.add(id);
+      atualizados += resEspelhoVet.atualizados;
       const idxVetMesAnterior = obterIdxRodizioAposUltimoPlantaoAntesDe(
         plantoes,
         ordemAtualVet,
@@ -2875,7 +3420,8 @@ async function recalcularEscalaInterno(
       );
       ordemAtualVet = rotacionarOrdemParaProximoPreferencial(ordemAtualVet, idxVetMesAnterior);
       ordemGlobalVet = rotacionarOrdemParaProximoPreferencial(ordemGlobalVet, idxVetMesAnterior);
-      idxOrdemVet = 0;
+      idxOrdemVet = idxVetMesAnterior;
+      idxState.idxVet = idxOrdemVet;
       const idxTecMesAnterior = obterIdxRodizioAposUltimoPlantaoAntesDe(
         plantoes,
         ordemAtualTec,
@@ -2886,7 +3432,6 @@ async function recalcularEscalaInterno(
       ordemAtualTec = rotacionarOrdemParaProximoPreferencial(ordemAtualTec, idxTecMesAnterior);
       ordemGlobalTec = [...ordemAtualTec];
       idxOrdemTec = 0;
-      idxState.idxVet = 0;
       idxState.idxTec = 0;
       idxSincronizadoParaMesSeguinte = true;
       if (catPlantao === CATEGORIA_PLANTAO.TECNICO) {
@@ -2915,9 +3460,22 @@ async function recalcularEscalaInterno(
       continue;
     }
 
+    if (plantaoIdsMesSeguinteLote.has(Number(plantao.id))) {
+      avancarIdxOrdemAPartirDoPlantao(plantao, ordemAtual, catPlantao, idxState);
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO) idxOrdemTec = idxState.idxTec;
+      else idxOrdemVet = idxState.idxVet;
+      if (catPlantao === CATEGORIA_PLANTAO.TECNICO && Number(plantao.vagaIndice) === 0) {
+        const uid0 = Number(plantao.usuarioId);
+        if (Number.isFinite(uid0) && uid0 > 0) {
+          primeiroUsuarioNoDiaTech.set(dataIso, uid0);
+        }
+      }
+      continue;
+    }
+
     if (
       catPlantao === CATEGORIA_PLANTAO.TECNICO &&
-      (datasRetornoAbonoFocadoProcessados.has(dataIso) || plantaoIdsMesSeguinteLote.has(Number(plantao.id)))
+      datasRetornoAbonoFocadoProcessados.has(dataIso)
     ) {
       avancarIdxOrdemAPartirDoPlantao(plantao, ordemAtual, catPlantao, idxState);
       idxOrdemTec = idxState.idxTec;
@@ -2972,25 +3530,37 @@ async function recalcularEscalaInterno(
       }
     }
 
+    const retornosHojeFocado = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
+    const vetDuplicataFimDeSemanaAnterior =
+      catPlantao === CATEGORIA_PLANTAO.VETERINARIO &&
+      plantaoVetMesmaPessoaNoFimDeSemanaAnterior(plantoes, plantao);
+
     const plantaoExigeRecalculoFocado =
       aplicarModoFocadoNoPlantao &&
       usuarioAfetadoRecalculoId != null &&
-      plantaoRequerRecalculoFocado(
-        usuarioAfetadoRecalculoId,
-        plantao,
-        dataIso,
-        ordemAtual,
-        retornosFeriasNoPrimeiroPlantao,
-        afastamentosPorUsuario,
-        datasNaoUteisParaRetornoPosAfastamento,
-        historicoAfastamento,
-        outrosAfastamentosFocado,
-      );
+      (vetDuplicataFimDeSemanaAnterior ||
+        plantaoRequerRecalculoFocado(
+          usuarioAfetadoRecalculoId,
+          plantao,
+          dataIso,
+          ordemAtual,
+          retornosFeriasNoPrimeiroPlantao,
+          afastamentosPorUsuario,
+          datasNaoUteisParaRetornoPosAfastamento,
+          historicoAfastamento,
+          outrosAfastamentosFocado,
+          datasPlantoesVetOrdenadas,
+        ));
 
+    /**
+     * Não pular: dias com retorno no mapa (ex.: Daniel no 20) — só enfileirar deixava a fila
+     * suja e o domingo seguinte herdava o mesmo titular (D21). Nem duplicata D20/D21.
+     */
     const podePularPlantaoNoModoFocado =
       aplicarModoFocadoNoPlantao &&
       usuarioAfetadoRecalculoId != null &&
-      !plantaoExigeRecalculoFocado;
+      !plantaoExigeRecalculoFocado &&
+      retornosHojeFocado.length === 0;
 
     if (podePularPlantaoNoModoFocado) {
       const duplicataTecVaga1 =
@@ -3050,27 +3620,38 @@ async function recalcularEscalaInterno(
     /** Base da busca por substituto (pode diferir do preferencial em retroativo focalizado). */
     let idxBaseBuscaSubstituto = idxPreferencial;
     let titularIndisponivelNoPlantao = null;
+    const afFocAloc = historicoAfastamento
+      ? historicoAfastamento.get
+        ? historicoAfastamento.get({ plain: true })
+        : historicoAfastamento
+      : null;
+    const inicioAfIsoAloc = afFocAloc ? dataReferenciaParaStr(afFocAloc.dataInicio) : null;
+    const retroVetAbonoAfetado =
+      aplicarModoFocadoNoPlantao &&
+      catPlantao === CATEGORIA_PLANTAO.VETERINARIO &&
+      afFocAloc &&
+      afastamentoEhAbono(afFocAloc) &&
+      usuarioAfetadoRecalculoId != null &&
+      inicioAfIsoAloc &&
+      dataIso < inicioAfIsoAloc &&
+      Number(plantao.usuarioId) === usuarioAfetadoRecalculoId &&
+      usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+        afastamentosPorUsuario,
+        usuarioAfetadoRecalculoId,
+        dataIso,
+        datasNaoUteisParaRetornoPosAfastamento,
+      );
     if (
       aplicarModoFocadoNoPlantao &&
       usuarioAfetadoRecalculoId != null &&
-      Number(plantao.usuarioId) === usuarioAfetadoRecalculoId &&
+      (retroVetAbonoAfetado || Number(plantao.usuarioId) === usuarioAfetadoRecalculoId) &&
       !(afFocadoPlain && afastamentoEhAbono(afFocadoPlain) && catPlantao === CATEGORIA_PLANTAO.TECNICO)
     ) {
       const posAfetado = ordemAtual.indexOf(usuarioAfetadoRecalculoId);
       if (posAfetado >= 0) {
         usuarioPreferencial = usuarioAfetadoRecalculoId;
         idxPreferencial = posAfetado;
-        const afFoc = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
-        const inicioAfIso = dataReferenciaParaStr(afFoc.dataInicio);
-        const retroTitular =
-          !!inicioAfIso &&
-          dataIso < inicioAfIso &&
-          usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
-            afastamentosPorUsuario,
-            usuarioAfetadoRecalculoId,
-            dataIso,
-            datasNaoUteisParaRetornoPosAfastamento,
-          );
+        const retroTitular = retroVetAbonoAfetado;
         const indisponivelNoDia = usuarioIndisponivelParaPlantaoNoDia(
           afastamentosPorUsuario,
           usuarioAfetadoRecalculoId,
@@ -3144,18 +3725,19 @@ async function recalcularEscalaInterno(
         filaRetornosFeriasPendentes.push(uid);
       }
     }
-    const retornoFeriasForcado =
-      retornosHoje.length > 0
-        ? escolherRetornoFeriasDoDia(
-            filaRetornosFeriasPendentes,
-            ordemAtual,
-            idxPreferencial,
-            afastamentosPorUsuario,
-            dataIso,
-            datasNaoUteisParaRetornoPosAfastamento,
-            idsExcluirMesmoDia,
-          )
-        : null;
+    const temRetornoFeriasPendente =
+      retornosHoje.length > 0 || filaRetornosFeriasPendentes.length > 0;
+    const retornoFeriasForcado = temRetornoFeriasPendente
+      ? escolherRetornoFeriasDoDia(
+          filaRetornosFeriasPendentes,
+          ordemAtual,
+          idxPreferencial,
+          afastamentosPorUsuario,
+          dataIso,
+          datasNaoUteisParaRetornoPosAfastamento,
+          idsExcluirMesmoDia,
+        )
+      : null;
 
     if (retornoFeriasForcado != null && !idsExcluirMesmoDia.has(Number(retornoFeriasForcado))) {
       usuarioAlocado = retornoFeriasForcado;
@@ -3298,6 +3880,11 @@ async function recalcularEscalaInterno(
    */
   const abonoFocadoReconstruirOrdemTec =
     modoRecalculoFocado && afFocadoPlain && afastamentoEhAbono(afFocadoPlain);
+  const afastamentoFocadoReconstruirOrdemVet =
+    modoRecalculoFocado &&
+    afFocadoPlain &&
+    (afastamentoEhAbono(afFocadoPlain) || afastamentoEhFerias(afFocadoPlain)) &&
+    ordemAtualDbInicialVet.includes(Number(afFocadoPlain.usuarioId));
   if (abonoFocadoReconstruirOrdemTec) {
     const afList = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
     const reb = derivarOrdemTecRodizioConsistenteComPlantoes({
@@ -3312,9 +3899,30 @@ async function recalcularEscalaInterno(
       idxOrdemTec = reb.idxOrdem;
     }
   }
-
-  ordemAtualVet = rotacionarOrdemParaProximoPreferencial(ordemAtualVet, idxOrdemVet);
-  ordemGlobalVet = rotacionarOrdemParaProximoPreferencial(ordemGlobalVet, idxOrdemVet);
+  if (afastamentoFocadoReconstruirOrdemVet) {
+    const afList = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+    const ordemRefVet = ordemAtualDbInicialVet.length ? ordemAtualDbInicialVet : ordemAtualVet;
+    /** Como técnicos: fila interna + rotação a partir do calendário gravado após o focalizado. */
+    const rebVet = derivarOrdemVetRodizioConsistenteComPlantoes({
+      plantoes,
+      ordemBase: normalizarOrdemRodizioCompleta(
+        ordemAtualVet.length ? ordemAtualVet : ordemRefVet,
+        ordemRefVet,
+      ),
+      afastamentosLista: afList,
+      datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+      modo: 'replay',
+      dataLimiteRotacaoIso: dataLimitePuloFocado || null,
+    });
+    if (rebVet.ordemPersistida.length > 0) {
+      ordemAtualVet = rebVet.ordemAtual;
+      ordemGlobalVet = [...rebVet.ordemPersistida];
+      idxOrdemVet = rebVet.idxOrdem;
+    }
+  } else {
+    ordemAtualVet = rotacionarOrdemParaProximoPreferencial(ordemAtualVet, idxOrdemVet);
+    ordemGlobalVet = rotacionarOrdemParaProximoPreferencial(ordemGlobalVet, idxOrdemVet);
+  }
   if (!abonoFocadoReconstruirOrdemTec) {
     ordemAtualTec = rotacionarOrdemParaProximoPreferencial(ordemAtualTec, idxOrdemTec);
     ordemGlobalTec = rotacionarOrdemParaProximoPreferencial(ordemGlobalTec, idxOrdemTec);
@@ -5102,6 +5710,13 @@ EscalaService.__testables = {
   usuarioRetornoFeriasAbonoJaRealizadoAntesDe,
   sincronizarIdxOrdemDePlantoes,
   plantaoRequerRecalculoFocado,
+  plantaoRequerRecalculoFocadoVet,
+  plantaoRequerRecalculoFocadoTec,
+  primeiraDataPlantaoRetornoPosFeriasOuAbono,
+  ultimoDiaPlantaoRetroCadastroAntesInicio,
+  derivarOrdemVetRodizioConsistenteComPlantoes,
+  espelharPlantoesVetMesSeguintePeloMesAnterior,
+  prioridadeRetornoCicloUsuario,
   buscarProximoUsuarioDisponivelNoCiclo,
   processarRetroativoFocadoEmLote,
   corrigirCoberturaDuplicadaAposRetro,
@@ -5110,6 +5725,7 @@ EscalaService.__testables = {
   afastamentoExigeRecalculoPlenoComHistoricoInicial,
   rotacionarOrdemParaProximoPreferencial,
   simularRodizioVetPlantoes,
+  plantaoVetMesmaPessoaNoFimDeSemanaAnterior,
   simularRodizioTecPlantoes,
   simularRodizioTecModoFocado,
   corrigirDuplicatasTecnicosMesmoDia,
