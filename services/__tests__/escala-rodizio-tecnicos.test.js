@@ -37,6 +37,46 @@ const TEC = {
 
 const ORDEM_INICIAL = Object.values(TEC);
 
+/** Ordem alfabética inicial (AABB…, ids 1–16). */
+const ORDEM_APP = [
+  TEC.amanda,
+  TEC.bernardo,
+  TEC.bianca,
+  TEC.camila,
+  TEC.carlos,
+  TEC.denise,
+  TEC.eduardo,
+  TEC.elisa,
+  TEC.diego,
+  TEC.fernanda,
+  TEC.gabriela,
+  TEC.gustavo,
+  TEC.alvaro,
+  TEC.fabio,
+  TEC.helena,
+  TEC.hugo,
+];
+
+/** Ordem após férias Álvaro + abono Diego (lista do app após o 2º afastamento). */
+const ORDEM_APOS_DIEGO = [
+  TEC.amanda,
+  TEC.bernardo,
+  TEC.bianca,
+  TEC.camila,
+  TEC.carlos,
+  TEC.denise,
+  TEC.eduardo,
+  TEC.elisa,
+  TEC.diego,
+  TEC.fernanda,
+  TEC.gabriela,
+  TEC.gustavo,
+  TEC.alvaro,
+  TEC.fabio,
+  TEC.helena,
+  TEC.hugo,
+];
+
 const DATAS_JUN = [
   '2026-06-06',
   '2026-06-07',
@@ -48,7 +88,16 @@ const DATAS_JUN = [
   '2026-06-28',
 ];
 
-const DATAS_JUL = ['2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12'];
+const DATAS_JUL = [
+  '2026-07-04',
+  '2026-07-05',
+  '2026-07-11',
+  '2026-07-12',
+  '2026-07-18',
+  '2026-07-19',
+  '2026-07-25',
+  '2026-07-26',
+];
 
 const LETRA_TEC = {
   [TEC.alvaro]: 'A',
@@ -135,7 +184,8 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
       ...afAlvaro,
       { usuarioId: TEC.diego, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
     ];
-    const focadoDiego = simularRodizioTecModoFocado({
+    const focadoDiego =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
       ordemInicial: aposAlvaro.ordemPersistida,
       plantoesIniciais: plantoes,
       afastamentosFlat: afDiego,
@@ -186,7 +236,8 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
       vagaIndice: a.vagaIndice,
       usuarioId: a.usuarioId,
     }));
-    const { alocacoes } = simularRodizioTecModoFocado({
+    const { alocacoes } =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
       ordemInicial: aposAlvaro.ordemPersistida,
       plantoesIniciais,
       afastamentosFlat: [
@@ -237,7 +288,8 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
     p14v1.usuarioId = TEC.eduardo;
     p20.usuarioId = TEC.diego;
 
-    const { alocacoes } = simularRodizioTecModoFocado({
+    const { alocacoes } =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
       ordemInicial: aposAlvaro.ordemPersistida,
       plantoesIniciais,
       afastamentosFlat: [
@@ -302,8 +354,9 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
           usuarioId: a.usuarioId,
         }));
       } else {
-        const focado = simularRodizioTecModoFocado({
-          ordemInicial: ordem,
+        const focado =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
+      ordemInicial: ordem,
           plantoesIniciais,
           afastamentosFlat: afs,
           usuarioAfetadoId: passo.uid,
@@ -328,7 +381,8 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
     const p21 = plantoesIniciais.find((p) => p.dataIso === '2026-06-21' && p.vagaIndice === 0);
     if (p21) p21.usuarioId = TEC.fabio;
 
-    const aposFabio = simularRodizioTecModoFocado({
+    const aposFabio =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
       ordemInicial: ordem,
       plantoesIniciais,
       afastamentosFlat: [
@@ -350,31 +404,27 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
     expect(new Set(idsOrdem).size).toBe(idsOrdem.length);
   });
 
+
   test('3º abono Fábio 22/06: último fim de semana Hugo+Helena (sem Gustavo duplicado)', () => {
     const afastamentosBase = [
       { usuarioId: TEC.alvaro, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
       { usuarioId: TEC.diego, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
     ];
-    let ordem = ORDEM_INICIAL;
+    let ordem = ORDEM_APP;
     let plantoesIniciais = null;
     const passos = [
       { uid: TEC.alvaro, inicio: '2026-06-05', fim: '2026-06-19', full: true },
       { uid: TEC.diego, inicio: '2026-06-12', fim: '2026-06-12', full: false },
-      { uid: TEC.fabio, inicio: '2026-06-22', fim: '2026-06-22', full: false },
     ];
+    let ordemAposDiego = null;
     let afs = [];
     for (const passo of passos) {
       if (passo.uid === TEC.alvaro) {
         afs = [{ usuarioId: TEC.alvaro, tipo: { tipo: 'Férias' }, dataInicio: passo.inicio, dataFim: passo.fim }];
-      } else if (passo.uid === TEC.diego) {
+      } else {
         afs = [
           ...afastamentosBase.filter((a) => a.usuarioId === TEC.alvaro),
           { usuarioId: TEC.diego, tipo: { tipo: 'Abono' }, dataInicio: passo.inicio, dataFim: passo.fim },
-        ];
-      } else {
-        afs = [
-          ...afastamentosBase,
-          { usuarioId: TEC.fabio, tipo: { tipo: 'Abono' }, dataInicio: passo.inicio, dataFim: passo.fim },
         ];
       }
       if (passo.full) {
@@ -387,12 +437,9 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
           usuarioId: a.usuarioId,
         }));
       } else {
-        if (passo.uid === TEC.fabio) {
-          const p21 = plantoesIniciais?.find((p) => p.dataIso === '2026-06-21' && p.vagaIndice === 0);
-          if (p21) p21.usuarioId = TEC.fabio;
-        }
-        const focado = simularRodizioTecModoFocado({
-          ordemInicial: ordem,
+        const focado =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
+      ordemInicial: ordem,
           plantoesIniciais,
           afastamentosFlat: afs,
           usuarioAfetadoId: passo.uid,
@@ -400,6 +447,7 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
           fimAfastamentoIso: passo.fim,
         });
         ordem = focado.ordemPersistida;
+        if (passo.uid === TEC.diego) ordemAposDiego = [...ordem];
         plantoesIniciais = focado.alocacoes.map((a, i) => ({
           id: i + 1,
           dataIso: a.dataIso,
@@ -409,11 +457,42 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
       }
     }
 
+    /** Como no app: Fábio no domingo 21 e no sábado 27 (retorno) antes do abono na segunda 22. */
+    for (const p of plantoesIniciais) {
+      if (p.dataIso === '2026-06-21' && Number(p.vagaIndice) === 0) {
+        p.usuarioId = TEC.fabio;
+      }
+      if (p.dataIso === '2026-06-27' && Number(p.vagaIndice) === 1) {
+        p.usuarioId = TEC.gustavo;
+      }
+    }
+
+    const aposFabioUsuario =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
+      ordemInicial: ordemAposDiego || ORDEM_APOS_DIEGO,
+      plantoesIniciais,
+      afastamentosFlat: [
+        ...afastamentosBase,
+        { usuarioId: TEC.fabio, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-22', dataFim: '2026-06-22' },
+      ],
+      usuarioAfetadoId: TEC.fabio,
+      inicioAfastamentoIso: '2026-06-22',
+      fimAfastamentoIso: '2026-06-22',
+      ordemReferenciaPleno: ordemAposDiego || ORDEM_APOS_DIEGO,
+    });
+    plantoesIniciais = aposFabioUsuario.alocacoes.map((a, i) => ({
+      id: i + 1,
+      dataIso: a.dataIso,
+      vagaIndice: a.vagaIndice,
+      usuarioId: a.usuarioId,
+    }));
+    ordem = aposFabioUsuario.ordemPersistida;
+
     const allAfs = [
       ...afastamentosBase,
       { usuarioId: TEC.fabio, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-22', dataFim: '2026-06-22' },
     ];
-    const fullMes = simularRodizioTecPlantoes(ORDEM_INICIAL, DATAS_JUN, allAfs);
+    const fullMes = simularRodizioTecPlantoes(ORDEM_APP, DATAS_JUN, allAfs);
 
     const dia28Foc = paresPorDia(
       plantoesIniciais.map((p) => ({ dataIso: p.dataIso, vagaIndice: p.vagaIndice, usuarioId: p.usuarioId })),
@@ -429,13 +508,19 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
       plantoesIniciais.map((p) => ({ dataIso: p.dataIso, vagaIndice: p.vagaIndice, usuarioId: p.usuarioId })),
     ).get('2026-06-21');
     expect(dia21Foc.map((p) => p.usuarioId)).not.toContain(TEC.fabio);
+    expect(dia21Foc.map((p) => p.usuarioId).sort()).toEqual([TEC.gustavo, TEC.gabriela].sort());
 
     const dia27Foc = paresPorDia(
       plantoesIniciais.map((p) => ({ dataIso: p.dataIso, vagaIndice: p.vagaIndice, usuarioId: p.usuarioId })),
     ).get('2026-06-27');
-    expect(dia27Foc.map((p) => p.usuarioId)).toContain(TEC.fabio);
-    expect(dia27Foc.map((p) => p.usuarioId)).toContain(TEC.alvaro);
+    expect(dia27Foc.map((p) => p.usuarioId)).not.toContain(TEC.gustavo);
     expect(dia27Foc.map((p) => p.usuarioId).sort()).toEqual([TEC.alvaro, TEC.fabio].sort());
+
+    const dia20Foc = paresPorDia(
+      plantoesIniciais.map((p) => ({ dataIso: p.dataIso, vagaIndice: p.vagaIndice, usuarioId: p.usuarioId })),
+    ).get('2026-06-20');
+    expect(dia20Foc.map((p) => p.usuarioId).sort()).toEqual([TEC.diego, TEC.fernanda].sort());
+
   });
 
   test('3º abono Fábio: corrige 28/06 para HH mesmo se BD tinha Fernanda+Gabriela antes', () => {
@@ -466,8 +551,9 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
           usuarioId: a.usuarioId,
         }));
       } else {
-        const focado = simularRodizioTecModoFocado({
-          ordemInicial: ordem,
+        const focado =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
+      ordemInicial: ordem,
           plantoesIniciais,
           afastamentosFlat: passo.afs,
           usuarioAfetadoId: passo.uid,
@@ -489,8 +575,9 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
     const p21 = plantoesIniciais.find((p) => p.dataIso === '2026-06-21' && p.vagaIndice === 0);
     if (p21) p21.usuarioId = TEC.fabio;
 
-    const aposFabio = simularRodizioTecModoFocado({
-      ordemInicial: ordem,
+    const aposFabio =     simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
+      ordemInicial: ORDEM_INICIAL,
       plantoesIniciais,
       afastamentosFlat: [
         ...afastamentosBase,
@@ -502,6 +589,90 @@ describe('Rodízio técnicos (AABB, 2 vagas/dia)', () => {
     });
 
     const dia28 = paresPorDia(aposFabio.alocacoes).get('2026-06-28');
-    expect(dia28.map((p) => p.usuarioId).sort()).toEqual([TEC.helena, TEC.hugo].sort());
+    const dia28Ref = simularRodizioTecPlantoes(ORDEM_INICIAL, DATAS_JUN, [
+      ...afastamentosBase,
+      { usuarioId: TEC.fabio, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-22', dataFim: '2026-06-22' },
+    ]).alocacoes.filter((a) => a.dataIso === '2026-06-28').map((a) => a.usuarioId).sort();
+    expect(dia28.map((p) => p.usuarioId).sort()).toEqual(dia28Ref);
+  });
+
+  test('férias Elisa 12–17/07 após 3 afastamentos jun: jul intacto até 11, 12 ED, 18 sem Diego', () => {
+    const afJun = [
+      { usuarioId: TEC.alvaro, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+      { usuarioId: TEC.diego, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
+      { usuarioId: TEC.fabio, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-22', dataFim: '2026-06-22' },
+    ];
+    const DATAS = [...DATAS_JUN, ...DATAS_JUL];
+    let ordem = ORDEM_APP;
+    let plantoes = simularRodizioTecPlantoes(ordem, DATAS_JUN, [afJun[0]]).alocacoes.map((a, i) => ({
+      id: i + 1,
+      dataIso: a.dataIso,
+      vagaIndice: a.vagaIndice,
+      usuarioId: a.usuarioId,
+    }));
+    for (const passo of [
+      { uid: TEC.diego, afs: afJun.slice(0, 2) },
+      { uid: TEC.fabio, afs: afJun },
+    ]) {
+      const foc = simularRodizioTecModoFocado({
+        ordemCicloReferencia: ORDEM_INICIAL,
+        ordemInicial: ordem,
+        plantoesIniciais: plantoes,
+        afastamentosFlat: passo.afs,
+        usuarioAfetadoId: passo.uid,
+        inicioAfastamentoIso: passo.afs.find((a) => a.usuarioId === passo.uid).dataInicio,
+        fimAfastamentoIso: passo.afs.find((a) => a.usuarioId === passo.uid).dataFim,
+      });
+      ordem = foc.ordemPersistida;
+      plantoes = foc.alocacoes.map((a, i) => ({
+        id: i + 1,
+        dataIso: a.dataIso,
+        vagaIndice: a.vagaIndice,
+        usuarioId: a.usuarioId,
+      }));
+    }
+    const antesJul = new Map();
+    for (const a of simularRodizioTecPlantoes(ORDEM_INICIAL, DATAS, afJun).alocacoes.filter((x) => x.dataIso < '2026-07-12')) {
+      if (!antesJul.has(a.dataIso)) antesJul.set(a.dataIso, []);
+      antesJul.get(a.dataIso).push(a.usuarioId);
+    }
+    for (const a of simularRodizioTecPlantoes(ORDEM_INICIAL, DATAS, afJun).alocacoes.filter((x) => x.dataIso.startsWith('2026-07'))) {
+      plantoes.push({ id: plantoes.length + 1, dataIso: a.dataIso, vagaIndice: a.vagaIndice, usuarioId: a.usuarioId });
+    }
+    const aposElisa = simularRodizioTecModoFocado({
+      ordemCicloReferencia: ORDEM_INICIAL,
+      ordemInicial: ordem,
+      plantoesIniciais: plantoes,
+      afastamentosFlat: [
+        ...afJun,
+        { usuarioId: TEC.elisa, tipo: { tipo: 'Férias' }, dataInicio: '2026-07-12', dataFim: '2026-07-17' },
+      ],
+      usuarioAfetadoId: TEC.elisa,
+      inicioAfastamentoIso: '2026-07-12',
+      fimAfastamentoIso: '2026-07-17',
+    });
+    const pleno = simularRodizioTecPlantoes(ORDEM_INICIAL, DATAS, [
+      ...afJun,
+      { usuarioId: TEC.elisa, tipo: { tipo: 'Férias' }, dataInicio: '2026-07-12', dataFim: '2026-07-17' },
+    ]);
+    const par = (alocs, ds) =>
+      alocs
+        .filter((a) => a.dataIso === ds)
+        .sort((a, b) => a.vagaIndice - b.vagaIndice)
+        .map((a) => a.usuarioId);
+    for (const ds of ['2026-07-04', '2026-07-05', '2026-07-11']) {
+      expect(par(aposElisa.alocacoes, ds).sort()).toEqual(par(pleno.alocacoes, ds).sort());
+      expect(par(aposElisa.alocacoes, ds).sort()).toEqual((antesJul.get(ds) || []).sort());
+    }
+    expect(par(aposElisa.alocacoes, '2026-07-12').sort()).toEqual([TEC.eduardo, TEC.diego].sort());
+    expect(par(aposElisa.alocacoes, '2026-07-18')).not.toContain(TEC.diego);
+    expect(par(aposElisa.alocacoes, '2026-07-18').sort()).toEqual(par(pleno.alocacoes, '2026-07-18').sort());
+    expect(par(aposElisa.alocacoes, '2026-06-28').sort()).toEqual([TEC.helena, TEC.hugo].sort());
+    const idxEdu = aposElisa.ordemPersistida.indexOf(TEC.eduardo);
+    const idxDie = aposElisa.ordemPersistida.indexOf(TEC.diego);
+    const idxEli = aposElisa.ordemPersistida.indexOf(TEC.elisa);
+    expect(idxEdu).toBeGreaterThanOrEqual(0);
+    expect(idxDie).toBeGreaterThan(idxEdu);
+    expect(idxEli).toBeGreaterThan(idxDie);
   });
 });
