@@ -469,6 +469,193 @@ function textoGestaoAtestadoMedico(afastamentosPreferencial, rotuloProfissional 
   return `Gestão - Atestado médico ${nome}`;
 }
 
+/** Feriado/ponto facultativo incluído com escala ativa — ordem dos membros não é recalculada. */
+function textoGestaoDataAdicionalPlantao() {
+  return 'Gestão - Feriado ou data adicional de plantão';
+}
+
+/**
+ * Cria plantões em datas extras (feriado/facultativo) simulando o rodízio atual, sem alterar ordem na escala.
+ */
+async function criarPlantoesDatasExtrasModoGestao(escala, novasDatas, criadoPorUsuarioId, transaction) {
+  const escalaId = Number(escala.id);
+  const dataInicioStr = dataReferenciaParaStr(escala.dataInicio);
+  const dataFimStr = dataReferenciaParaStr(escala.dataFim);
+
+  const membros = await obterMembrosAtivosEscala(escalaId, transaction);
+  const ordemVet = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  const ordemTec = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  if (ordemVet.length === 0 && ordemTec.length < 2) {
+    throw new ApiBaseError('Escala sem membros suficientes no rodízio para incluir a data adicional.');
+  }
+
+  const plantoesDb = await PlantaoModel.findAll({
+    where: { escalaId },
+    order: [
+      ['dataReferencia', 'ASC'],
+      [sequelize.literal("CASE WHEN categoria_plantao = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+      ['vagaIndice', 'ASC'],
+      ['id', 'ASC'],
+    ],
+    transaction,
+  });
+  const plantoesPlain = plantoesDb.map((p) => (p.get ? p.get({ plain: true }) : p));
+
+  const ordemGlobalVetAntes = await obterOrdemGlobalUsuarioIds(transaction, ESCOPO_ORDEM.VETERINARIO);
+  const ordemGlobalTecAntes = await obterOrdemGlobalUsuarioIds(transaction, ESCOPO_ORDEM.TECNICO);
+  const ordemEscalaVetAntes = [...ordemVet];
+  const ordemEscalaTecAntes = [...ordemTec];
+
+  const idsParaAfastamentos = [...new Set([...ordemVet, ...ordemTec])].filter((id) => Number.isFinite(id) && id > 0);
+  const afastamentos = await AfastamentoModel.findAll({
+    where: {
+      usuarioId: { [Op.in]: idsParaAfastamentos },
+      dataInicio: { [Op.lte]: dataFimStr },
+      dataFim: { [Op.gte]: dataInicioStr },
+    },
+    include: [
+      { model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] },
+      { model: UsuarioModel, as: 'usuario', attributes: ['id', 'nome', 'login', 'suspensoEscala'] },
+    ],
+    transaction,
+  });
+  const afFlat = afastamentos.map((a) => (a.get ? a.get({ plain: true }) : a));
+  const datasNaoUteisParaRetornoPosAfastamento =
+    String(escala.periodicidade || '').toLowerCase() === 'fim_de_semana'
+      ? new Set(
+          plantoesPlain
+            .map((p) => dataReferenciaParaStr(p.dataReferencia))
+            .filter((ds) => !!ds && !ehFimDeSemanaDataReferencia(ds)),
+        )
+      : new Set();
+
+  const primeiraNova = novasDatas[0];
+  const datasSim = mergeDatasPlantaoPrevisto(dataInicioStr, dataFimStr, novasDatas);
+  const datasDesde = datasSim.filter((ds) => ds >= primeiraNova);
+
+  const obsGestao = textoGestaoDataAdicionalPlantao();
+  const novosPlantoes = [];
+
+  if (ordemVet.length > 0) {
+    const idxVet = obterIdxRodizioAposUltimoPlantaoAntesDe(
+      plantoesPlain,
+      ordemVet,
+      primeiraNova,
+      CATEGORIA_PLANTAO.VETERINARIO,
+    );
+    const ordemVetRot = rotacionarOrdemParaProximoPreferencial(ordemVet, idxVet);
+    const simVet = simularRodizioVetPlantoes(ordemVetRot, datasDesde, afFlat, datasNaoUteisParaRetornoPosAfastamento);
+    for (const dataIso of novasDatas) {
+      const aloc = simVet.alocacoes.find((a) => a.dataIso === dataIso);
+      if (!aloc) continue;
+      novosPlantoes.push({
+        escalaId,
+        usuarioId: Number(aloc.usuarioId),
+        dataReferencia: dataIso,
+        categoriaPlantao: CATEGORIA_PLANTAO.VETERINARIO,
+        vagaIndice: 0,
+        status: 'previsto',
+        observacao: obsGestao,
+        ordemGlobalUsuarioIdsAntes: ordemGlobalVetAntes,
+        ordemEscalaUsuarioIdsAntes: ordemEscalaVetAntes,
+      });
+    }
+  }
+
+  if (ordemTec.length >= 2) {
+    const ordemRefCicloTec = await obterOrdemCicloReferenciaEscala(
+      escalaId,
+      ordemTec,
+      CATEGORIA_MEMBRO.TECNICO,
+      transaction,
+    );
+    const idxTec = obterIdxRodizioAposUltimoPlantaoAntesDe(
+      plantoesPlain,
+      ordemTec,
+      primeiraNova,
+      CATEGORIA_PLANTAO.TECNICO,
+      ordemRefCicloTec,
+    );
+    const ordemTecRot = rotacionarOrdemParaProximoPreferencial(ordemTec, idxTec);
+    const simTec = simularRodizioTecPlantoes(
+      ordemTecRot,
+      datasDesde,
+      afFlat,
+      datasNaoUteisParaRetornoPosAfastamento,
+      0,
+      plantoesPlain,
+      primeiraNova,
+    );
+    for (const dataIso of novasDatas) {
+      const alocs = simTec.alocacoes.filter((a) => a.dataIso === dataIso);
+      for (const aloc of alocs) {
+        novosPlantoes.push({
+          escalaId,
+          usuarioId: Number(aloc.usuarioId),
+          dataReferencia: dataIso,
+          categoriaPlantao: CATEGORIA_PLANTAO.TECNICO,
+          vagaIndice: Number(aloc.vagaIndice) || 0,
+          status: 'previsto',
+          observacao: obsGestao,
+          ordemGlobalUsuarioIdsAntes: ordemGlobalTecAntes,
+          ordemEscalaUsuarioIdsAntes: ordemEscalaTecAntes,
+        });
+      }
+    }
+  }
+
+  if (novosPlantoes.length === 0) {
+    throw new ApiBaseError('Não foi possível alocar profissionais para a data adicional informada.');
+  }
+
+  await PlantaoModel.bulkCreate(novosPlantoes, { transaction });
+
+  if (ordemVet.length > 0) {
+    await registrarEventoAuditoriaEscala({
+      escalaId,
+      categoriaMembro: CATEGORIA_MEMBRO.VETERINARIO,
+      tipoEvento: 'feriado_inclusao',
+      referenciaTipo: 'escala',
+      referenciaId: escalaId,
+      ordemAntesUsuarioIds: ordemEscalaVetAntes,
+      ordemDepoisUsuarioIds: ordemEscalaVetAntes,
+      detalhes: { datas: novasDatas, modoGestao: true },
+      criadoPorUsuarioId,
+      transaction,
+    });
+  }
+  if (ordemTec.length > 0) {
+    await registrarEventoAuditoriaEscala({
+      escalaId,
+      categoriaMembro: CATEGORIA_MEMBRO.TECNICO,
+      tipoEvento: 'feriado_inclusao',
+      referenciaTipo: 'escala',
+      referenciaId: escalaId,
+      ordemAntesUsuarioIds: ordemEscalaTecAntes,
+      ordemDepoisUsuarioIds: ordemEscalaTecAntes,
+      detalhes: { datas: novasDatas, modoGestao: true },
+      criadoPorUsuarioId,
+      transaction,
+    });
+  }
+
+  return {
+    adicionados: novasDatas.length,
+    atualizados: 0,
+    ordemAlterada: false,
+    ordemGlobalAlterada: false,
+    permutasCanceladas: 0,
+    modoGestao: true,
+    datas: novasDatas,
+  };
+}
+
 function adicionarDiasIso(dataIso, dias) {
   const d = new Date(`${dataIso}T12:00:00`);
   d.setDate(d.getDate() + dias);
@@ -5901,6 +6088,13 @@ const EscalaService = {
     const novas = uniques.filter((ds) => !jaTem.has(ds));
     if (novas.length === 0) throw new ApiBaseError('Todas as datas informadas já possuem plantão nesta escala.');
 
+    const escalaAtiva = String(escala.status || '').toLowerCase() === 'ativa';
+    if (escalaAtiva) {
+      return await sequelizeTransaction(async (t) =>
+        criarPlantoesDatasExtrasModoGestao(escala, novas, criadoPorUsuarioId, t),
+      );
+    }
+
     return await sequelizeTransaction(async (t) => {
       const membros = await obterMembrosAtivosEscala(escalaId, t);
       const membrosVet = membros.filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO);
@@ -6137,6 +6331,11 @@ const EscalaService = {
 
     const escala = await EscalaModel.findByPk(escalaId);
     if (!escala) throw new ApiBaseError('Escala não encontrada.');
+    if (String(escala.status || '').toLowerCase() === 'ativa') {
+      throw new ApiBaseError(
+        'Não é possível remover feriados ou datas adicionais enquanto a escala estiver ativa. Conclua a escala ou altere o status antes de remover.',
+      );
+    }
 
     const plantoes = await PlantaoModel.findAll({ where: { escalaId, id: { [Op.in]: ids } } });
     if (plantoes.length !== ids.length) {
@@ -6469,6 +6668,7 @@ EscalaService.__testables = {
   simularRodizioTecPlantoes,
   simularRodizioTecModoFocado,
   corrigirDuplicatasTecnicosMesmoDia,
+  textoGestaoDataAdicionalPlantao,
 };
 
 module.exports = EscalaService;
