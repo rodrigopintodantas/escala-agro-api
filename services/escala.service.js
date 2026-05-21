@@ -1169,7 +1169,51 @@ function plantaoRequerRecalculoFocadoVet(
   }
 
   const retornosHoje = retornosFeriasNoPrimeiroPlantao.get(dataIso) || [];
-  if (retornosHoje.some((u) => Number(u) === uid)) return true;
+  if (retornosHoje.some((u) => Number(u) === uid)) {
+    if (historicoAfastamento) {
+      const afRet = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
+      const temAnteriorRet = (outrosAfastamentosNaEscala || []).length > 0;
+      if (afastamentoEhFerias(afRet) && temAnteriorRet) {
+        const datasRefRet = Array.isArray(datasPlantoesOrdenadas) ? datasPlantoesOrdenadas : [];
+        const primeiraRetornoRet = dataPlantaoRetornoUsuario(
+          retornosFeriasNoPrimeiroPlantao,
+          afRet,
+          datasRefRet,
+          datasNaoUteisIsoSet,
+        );
+        if (primeiraRetornoRet && dataIso === primeiraRetornoRet) return true;
+        const idxRetFer = datasRefRet.indexOf(primeiraRetornoRet);
+        if (idxRetFer >= 0 && datasRefRet[idxRetFer + 1] === dataIso) return true;
+        return Number(plantao.usuarioId) === uid;
+      }
+    }
+    return true;
+  }
+  if (historicoAfastamento) {
+    const afHist = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
+    if (afastamentoEhFerias(afHist) && Number(afHist.usuarioId) === uid) {
+      const inicioIsoHist = dataReferenciaParaStr(afHist.dataInicio);
+      const fimIsoHist = dataReferenciaParaStr(afHist.dataFim);
+      const temAnteriorHist = (outrosAfastamentosNaEscala || []).length > 0;
+      if (inicioIsoHist && dataIso < inicioIsoHist) {
+        return Number(plantao.usuarioId) === uid;
+      }
+      if (fimIsoHist && dataIso > fimIsoHist && temAnteriorHist) {
+        const datasRefHist = Array.isArray(datasPlantoesOrdenadas) ? datasPlantoesOrdenadas : [];
+        const primeiraRetornoHist = dataPlantaoRetornoUsuario(
+          retornosFeriasNoPrimeiroPlantao,
+          afHist,
+          datasRefHist,
+          datasNaoUteisIsoSet,
+        );
+        if (Number(plantao.usuarioId) === uid) return true;
+        if (primeiraRetornoHist && dataIso === primeiraRetornoHist) return true;
+        const idxRetHist = datasRefHist.indexOf(primeiraRetornoHist);
+        if (idxRetHist >= 0 && datasRefHist[idxRetHist + 1] === dataIso) return true;
+        return false;
+      }
+    }
+  }
   if (Number(plantao.usuarioId) !== uid) return false;
   return usuarioIndisponivelParaPlantaoNoDia(afastamentosPorUsuario, uid, dataIso, datasNaoUteisIsoSet);
 }
@@ -1782,6 +1826,44 @@ function alinharParTecDiaSeguinteRetornoAbonoComRodizioPleno({
     }
   }
   return { atualizados };
+}
+
+/** Veterinário (1 vaga/dia): alinha titular do dia ao rodízio pleno de referência. */
+function alinharPlantaoVetDiaComRodizioPleno({
+  plantoes,
+  dataIso,
+  ordemInicial,
+  afastamentosFlat,
+  datasNaoUteisIsoSet = new Set(),
+}) {
+  if (!dataIso || !Array.isArray(plantoes) || plantoes.length === 0) return { atualizados: 0 };
+  const pl = plantoes.find(
+    (p) =>
+      categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+      dataReferenciaParaStr(p.dataReferencia) === dataIso,
+  );
+  if (!pl) return { atualizados: 0 };
+  const datasVet = [
+    ...new Set(
+      plantoes
+        .filter((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO)
+        .map((p) => dataReferenciaParaStr(p.dataReferencia))
+        .filter(Boolean),
+    ),
+  ].sort();
+  const sim = simularRodizioVetPlantoes(
+    ordemInicial,
+    datasVet.length ? datasVet : [dataIso],
+    afastamentosFlat,
+    datasNaoUteisIsoSet,
+  );
+  const esperado = sim.alocacoes.find((a) => a.dataIso === dataIso);
+  if (!esperado) return { atualizados: 0 };
+  const alvo = Number(esperado.usuarioId);
+  if (!Number.isFinite(alvo) || alvo < 1 || Number(pl.usuarioId) === alvo) return { atualizados: 0 };
+  pl.usuarioId = alvo;
+  pl.observacao = null;
+  return { atualizados: 1 };
 }
 
 /** Veterinário: mesmo titular no fim de semana anterior (ex.: D20 e D21 após pular retorno de Daniel no 20). */
@@ -3390,6 +3472,12 @@ async function recalcularEscalaInterno(
     CATEGORIA_MEMBRO.TECNICO,
     transaction,
   );
+  const ordemCicloRefVet = await obterOrdemCicloReferenciaEscala(
+    escalaId,
+    ordemAtualDbInicialVet,
+    CATEGORIA_MEMBRO.VETERINARIO,
+    transaction,
+  );
 
   let ordemAtualVet = [...ordemAtualDbInicialVet];
   let ordemAtualTec = [...ordemAtualDbInicialTec];
@@ -4342,11 +4430,17 @@ async function recalcularEscalaInterno(
     }
   }
 
+  const focalEhVet =
+    afFocadoPlain && ordemAtualDbInicialVet.includes(Number(afFocadoPlain.usuarioId));
+  const focalEhTec =
+    afFocadoPlain && ordemAtualDbInicialTec.includes(Number(afFocadoPlain.usuarioId));
+
   if (
     modoRecalculoFocado &&
     afFocadoPlain &&
     (afastamentoEhAbono(afFocadoPlain) || afastamentoEhFerias(afFocadoPlain)) &&
-    outrosAfastamentosFocado.length > 0
+    outrosAfastamentosFocado.length > 0 &&
+    focalEhTec
   ) {
     const afListAlinhar = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
     const ordemAlinharPleno =
@@ -4414,6 +4508,86 @@ async function recalcularEscalaInterno(
     }
   }
 
+  if (
+    modoRecalculoFocado &&
+    afFocadoPlain &&
+    (afastamentoEhAbono(afFocadoPlain) || afastamentoEhFerias(afFocadoPlain)) &&
+    outrosAfastamentosFocado.length > 0 &&
+    focalEhVet
+  ) {
+    const afListAlinharVet = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+    const ordemAlinharVet =
+      ordemCicloRefVet.length > 0
+        ? ordemCicloRefVet
+        : ordemAtualDbInicialVet.length
+          ? ordemAtualDbInicialVet
+          : ordemAtualVet;
+    const inicioIsoAlinharVet = dataReferenciaParaStr(afFocadoPlain.dataInicio);
+    const diasAlinharVet = new Set();
+    if (afastamentoEhAbono(afFocadoPlain) && inicioIsoAlinharVet) {
+      const ultimoDomingoVet = ultimoDiaPlantaoRetroCadastroAntesInicio(
+        inicioIsoAlinharVet,
+        Number(afFocadoPlain.usuarioId),
+        afastamentosPorUsuario,
+        datasNaoUteisParaRetornoPosAfastamento,
+      );
+      if (ultimoDomingoVet) diasAlinharVet.add(ultimoDomingoVet);
+    }
+    const primeiraRetornoVet = dataPlantaoRetornoUsuario(
+      retornosFeriasNoPrimeiroPlantao,
+      afFocadoPlain,
+      datasPlantoesVetOrdenadas,
+      datasNaoUteisParaRetornoPosAfastamento,
+    );
+    const idxRetVet = primeiraRetornoVet ? datasPlantoesVetOrdenadas.indexOf(primeiraRetornoVet) : -1;
+    const dataSeguinteVet =
+      idxRetVet >= 0 && idxRetVet + 1 < datasPlantoesVetOrdenadas.length
+        ? datasPlantoesVetOrdenadas[idxRetVet + 1]
+        : null;
+    if (afastamentoEhFerias(afFocadoPlain) && inicioIsoAlinharVet) {
+      for (const ds of datasPlantoesVetOrdenadas) {
+        if (ds >= inicioIsoAlinharVet) diasAlinharVet.add(ds);
+      }
+    } else {
+      if (afastamentoEhFerias(afFocadoPlain) && inicioIsoAlinharVet) {
+        diasAlinharVet.add(inicioIsoAlinharVet);
+      }
+      if (dataSeguinteVet) diasAlinharVet.add(dataSeguinteVet);
+      if (afastamentoEhFerias(afFocadoPlain)) {
+        const fimIsoFeriasVet = dataReferenciaParaStr(afFocadoPlain.dataFim);
+        if (fimIsoFeriasVet) {
+          for (const ds of datasPlantoesVetOrdenadas) {
+            if (ds > fimIsoFeriasVet) diasAlinharVet.add(ds);
+          }
+        }
+      }
+    }
+    if (afastamentoEhAbono(afFocadoPlain) && dataSeguinteVet) {
+      diasAlinharVet.add(dataSeguinteVet);
+    }
+    for (const dsAlinhar of diasAlinharVet) {
+      const resAlinharVet = alinharPlantaoVetDiaComRodizioPleno({
+        plantoes,
+        dataIso: dsAlinhar,
+        ordemInicial: ordemAlinharVet,
+        afastamentosFlat: afListAlinharVet,
+        datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+      });
+      if (resAlinharVet.atualizados > 0) {
+        for (const p of plantoes) {
+          if (
+            categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+            dataReferenciaParaStr(p.dataReferencia) === dsAlinhar &&
+            typeof p.save === 'function'
+          ) {
+            await p.save({ transaction });
+          }
+        }
+        atualizados += resAlinharVet.atualizados;
+      }
+    }
+  }
+
   atualizados += await corrigirDuplicatasTecnicosMesmoDia({
     plantoes,
     ordemAtualTec,
@@ -4461,7 +4635,12 @@ async function recalcularEscalaInterno(
   }
   if (afastamentoFocadoReconstruirOrdemVet) {
     const afList = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
-    const ordemRefVet = ordemAtualDbInicialVet.length ? ordemAtualDbInicialVet : ordemAtualVet;
+    const ordemRefVet =
+      ordemCicloRefVet.length > 0
+        ? ordemCicloRefVet
+        : ordemAtualDbInicialVet.length
+          ? ordemAtualDbInicialVet
+          : ordemAtualVet;
     /** Como técnicos: fila interna + rotação a partir do calendário gravado após o focalizado. */
     const rebVet = derivarOrdemVetRodizioConsistenteComPlantoes({
       plantoes,
@@ -6275,6 +6454,7 @@ EscalaService.__testables = {
   primeiraDataPlantaoRetornoPosFeriasOuAbono,
   ultimoDiaPlantaoRetroCadastroAntesInicio,
   derivarOrdemVetRodizioConsistenteComPlantoes,
+  alinharPlantaoVetDiaComRodizioPleno,
   espelharPlantoesVetMesSeguintePeloMesAnterior,
   prioridadeRetornoCicloUsuario,
   buscarProximoUsuarioDisponivelNoCiclo,
