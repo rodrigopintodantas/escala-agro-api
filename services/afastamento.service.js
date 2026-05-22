@@ -32,11 +32,21 @@ const AfastamentoService = {
       where,
       include: includePadrao,
       order: [
-        ['dataInicio', 'DESC'],
+        ['createdAt', 'DESC'],
         ['id', 'DESC'],
       ],
     });
-    return rows.map((r) => r.get({ plain: true }));
+    const { veterinario: idVet, tecnico: idTec } = await EscalaService.obterIdsAfastamentosMaisRecentesPorClasse();
+    const idsDesfazer = new Set(
+      [idVet, idTec].filter((x) => Number.isFinite(Number(x)) && Number(x) > 0).map(Number),
+    );
+    return rows.map((r) => {
+      const plain = r.get({ plain: true });
+      return {
+        ...plain,
+        desfazerDisponivel: idsDesfazer.has(Number(plain.id)),
+      };
+    });
   },
 
   criar: async (usuarioIdLogado, body) => {

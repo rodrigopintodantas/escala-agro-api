@@ -5063,82 +5063,55 @@ async function restaurarOrdemGlobalPreExclusaoEscala(escalaId, transaction) {
   }
 }
 
-async function restaurarOrdemEGlobalAntesDesfazerAfastamento(afastamentoPlain, transaction) {
-  const afId = Number(afastamentoPlain.id);
-  if (!Number.isFinite(afId)) return;
-
-  const countOutros = await AfastamentoModel.count({
-    where: { id: { [Op.ne]: afId } },
+/**
+ * Fila LIFO por classe (vet/técnico): id do afastamento com `createdAt` mais recente em cada escopo.
+ */
+async function obterIdsAfastamentosMaisRecentesPorClasse(transaction) {
+  const rows = await AfastamentoModel.findAll({
+    attributes: ['id', 'usuarioId', 'createdAt'],
+    order: [['createdAt', 'DESC']],
     transaction,
   });
+  const [vets, tecs] = await Promise.all([
+    EscalaService.listarVeterinarios(),
+    EscalaService.listarTecnicos(),
+  ]);
+  const idsVet = new Set(vets.map((v) => Number(v.id)));
+  const idsTec = new Set(tecs.map((t) => Number(t.id)));
+  let veterinario = null;
+  let tecnico = null;
+  for (const row of rows) {
+    const uid = Number(row.usuarioId);
+    if (veterinario == null && idsVet.has(uid)) {
+      veterinario = Number(row.id);
+    }
+    if (tecnico == null && idsTec.has(uid)) {
+      tecnico = Number(row.id);
+    }
+    if (veterinario != null && tecnico != null) break;
+  }
+  return { veterinario, tecnico };
+}
+
+async function afastamentoEhMaisRecenteDaClasse(afastamentoPlain, transaction) {
+  const id = Number(afastamentoPlain?.id);
+  if (!Number.isFinite(id)) return false;
+  const { veterinario, tecnico } = await obterIdsAfastamentosMaisRecentesPorClasse(transaction);
+  const escopo = await escopoOrdemGlobalParaUsuarioId(afastamentoPlain.usuarioId, transaction);
+  const alvo = escopo === ESCOPO_ORDEM.TECNICO ? tecnico : veterinario;
+  return alvo != null && Number(alvo) === id;
+}
+
+/** Restaura ordem na escala e ordem geral ao estado imediatamente anterior ao cadastro deste afastamento. */
+async function restaurarEstadoAntesAfastamento(afastamentoPlain, transaction) {
+  const afId = Number(afastamentoPlain.id);
+  if (!Number.isFinite(afId)) return;
 
   const rowsHist = await EscalaOrdemHistoricoModel.findAll({
     where: { afastamentoId: afId },
     transaction,
     order: [['id', 'DESC']],
   });
-
-  let escalaIdsAfetadas = [...new Set(rowsHist.map((h) => Number(h.escalaId)))];
-  if (escalaIdsAfetadas.length === 0) {
-    const mem = await EscalaMembroModel.findAll({
-      where: { usuarioId: Number(afastamentoPlain.usuarioId), ativo: true },
-      attributes: ['escalaId'],
-      transaction,
-    });
-    escalaIdsAfetadas = [...new Set(mem.map((m) => Number(m.escalaId)))];
-  }
-
-  /** Nenhum outro afastamento no sistema: volta à ordem gravada em motivo=inicial (escala + ordem geral). */
-  if (countOutros === 0) {
-    let ordemGlobalInicialVet = null;
-    let ordemGlobalInicialTec = null;
-    for (const escalaId of escalaIdsAfetadas) {
-      const histsInicial = await EscalaOrdemHistoricoModel.findAll({
-        where: { escalaId, motivo: 'inicial' },
-        order: [['id', 'ASC']],
-        transaction,
-      });
-      for (const histInicial of histsInicial) {
-        const plain = histInicial.get ? histInicial.get({ plain: true }) : histInicial;
-        const cat =
-          String(plain.categoriaOrdem || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO
-            ? CATEGORIA_MEMBRO.TECNICO
-            : CATEGORIA_MEMBRO.VETERINARIO;
-        if (Array.isArray(plain.ordemUsuarioIds) && plain.ordemUsuarioIds.length > 0) {
-          await atualizarOrdemMembrosEscalaSemColisao(
-            escalaId,
-            plain.ordemUsuarioIds.map((x) => Number(x)),
-            transaction,
-            cat,
-          );
-        }
-        if (Array.isArray(plain.ordemGlobalUsuarioIds) && plain.ordemGlobalUsuarioIds.length > 0) {
-          const og = plain.ordemGlobalUsuarioIds.map((x) => Number(x));
-          if (cat === CATEGORIA_MEMBRO.TECNICO) ordemGlobalInicialTec = og;
-          else ordemGlobalInicialVet = og;
-        }
-      }
-    }
-    const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamentoPlain.usuarioId, transaction);
-    if (
-      (!ordemGlobalInicialVet || ordemGlobalInicialVet.length === 0) &&
-      (!ordemGlobalInicialTec || ordemGlobalInicialTec.length === 0) &&
-      Array.isArray(afastamentoPlain.ordemGlobalUsuarioIdsAntes)
-    ) {
-      const og = afastamentoPlain.ordemGlobalUsuarioIdsAntes;
-      if (og.length > 0) {
-        if (escopoAf === ESCOPO_ORDEM.TECNICO) ordemGlobalInicialTec = og.map((x) => Number(x));
-        else ordemGlobalInicialVet = og.map((x) => Number(x));
-      }
-    }
-    if (ordemGlobalInicialVet && ordemGlobalInicialVet.length > 0) {
-      await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicialVet, transaction, ESCOPO_ORDEM.VETERINARIO);
-    }
-    if (ordemGlobalInicialTec && ordemGlobalInicialTec.length > 0) {
-      await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicialTec, transaction, ESCOPO_ORDEM.TECNICO);
-    }
-    return;
-  }
 
   for (const h of rowsHist) {
     const eid = Number(h.escalaId);
@@ -5153,10 +5126,13 @@ async function restaurarOrdemEGlobalAntesDesfazerAfastamento(afastamentoPlain, t
   }
 
   const og = afastamentoPlain.ordemGlobalUsuarioIdsAntes;
-  if (Array.isArray(og) && og.length > 0) {
-    const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamentoPlain.usuarioId, transaction);
-    await atualizarOrdemServidoresGlobalSemColisao(og.map((x) => Number(x)), transaction, escopoAf);
+  if (!Array.isArray(og) || og.length === 0) {
+    throw new ApiBaseError(
+      'Não foi possível desfazer: falta o registro da ordem anterior a este afastamento.',
+    );
   }
+  const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamentoPlain.usuarioId, transaction);
+  await atualizarOrdemServidoresGlobalSemColisao(og.map((x) => Number(x)), transaction, escopoAf);
 }
 
 /**
@@ -5250,6 +5226,8 @@ const EscalaService = {
     const up = await UsuarioPapelModel.findOne({ where: { UsuarioModelId: usuarioId, PapelModelId: papel.id } });
     return !!up;
   },
+
+  obterIdsAfastamentosMaisRecentesPorClasse: (transaction) => obterIdsAfastamentosMaisRecentesPorClasse(transaction),
 
   listarPermutas: async (usuarioId, verTodasComoAdmin) => {
     const where = verTodasComoAdmin
@@ -6243,15 +6221,20 @@ const EscalaService = {
     const escopoAf = await escopoOrdemGlobalParaUsuarioId(usuarioId, transaction);
     const categoriaAlvo = escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
 
-    await restaurarOrdemEGlobalAntesDesfazerAfastamento(afastamentoPlain, transaction);
+    if (!(await afastamentoEhMaisRecenteDaClasse(afastamentoPlain, transaction))) {
+      const rotulo = escopoAf === ESCOPO_ORDEM.TECNICO ? 'técnicos' : 'veterinários';
+      throw new ApiBaseError(
+        `Só é possível desfazer o afastamento mais recente da classe (${rotulo}), pelo cadastro mais novo no sistema.`,
+      );
+    }
+
+    await restaurarEstadoAntesAfastamento(afastamentoPlain, transaction);
 
     await AfastamentoModel.destroy({ where: { id }, transaction });
 
-    await refreshSnapshotsOrdemDeAfastamentosRestantes(transaction, afastamentoPlain);
-
     return await recalcularEscalasPorUsuarioPeriodoInterno(usuarioId, dataInicioStr, dataFimStr, {
       transactionExterna: transaction,
-      historicoMotivo: 'apos_desfazer_afastamento',
+      historicoMotivo: 'manual',
       historicoAfastamento: null,
       auditoriaContexto: {
         tipoEvento: 'afastamento_exclusao',
@@ -6716,6 +6699,9 @@ EscalaService.__testables = {
   corrigirDuplicatasTecnicosMesmoDia,
   textoGestaoDataAdicionalPlantao,
   restaurarOrdemGlobalPreExclusaoEscala,
+  obterIdsAfastamentosMaisRecentesPorClasse,
+  afastamentoEhMaisRecenteDaClasse,
+  restaurarEstadoAntesAfastamento,
 };
 
 module.exports = EscalaService;
