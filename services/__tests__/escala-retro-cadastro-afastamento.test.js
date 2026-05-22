@@ -32,6 +32,8 @@ describe('Afastamento férias/abono — retroativo ao cadastro', () => {
     enfileirarRetornosFeriasDoDia,
     escolherRetornoFeriasDoDia,
     primeiroDiaMesSeguinte,
+    escalaCobreNoMaximoDoisMeses,
+    sincronizarCalendarioRodizioPlenoEscalaBimestre,
     obterIdxRodizioAposUltimoPlantaoAntesDe,
     usuarioRetornoFeriasAbonoJaRealizadoAntesDe,
     normalizarOrdemRodizioCompleta,
@@ -101,6 +103,53 @@ describe('Afastamento férias/abono — retroativo ao cadastro', () => {
 
   test('primeiroDiaMesSeguinte após abono em 22/06 abre recálculo pleno em 01/07', () => {
     expect(primeiroDiaMesSeguinte('2026-06-22')).toBe('2026-07-01');
+  });
+
+  test('escalaCobreNoMaximoDoisMeses: jun–jul sim, três meses não', () => {
+    expect(escalaCobreNoMaximoDoisMeses('2026-06-01', '2026-07-31')).toBe(true);
+    expect(escalaCobreNoMaximoDoisMeses('2026-06-01', '2026-08-15')).toBe(false);
+    expect(escalaCobreNoMaximoDoisMeses('2026-06-15', '2026-06-30')).toBe(true);
+  });
+
+  test('bimestre: sincronizarCalendario pleno iguala jul ao rodízio contínuo (Ana+Daniel)', () => {
+    const DATAS_JUL_VET = [
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afs = [
+      { usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+      { usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
+    ];
+    const pleno = simularRodizioVetPlantoes(ORDEM_VET_PADRAO, [...DATAS_JUN_VET, ...DATAS_JUL_VET], afs);
+    const junErrado = pleno.alocacoes.filter((a) => a.dataIso.startsWith('2026-06'));
+    const plantoes = [
+      ...junErrado.map((a) => ({
+        dataReferencia: a.dataIso,
+        categoriaPlantao: 'veterinario',
+        usuarioId: 102,
+      })),
+      ...DATAS_JUL_VET.map((ds) => ({
+        dataReferencia: ds,
+        categoriaPlantao: 'veterinario',
+        usuarioId: 101,
+      })),
+    ];
+    sincronizarCalendarioRodizioPlenoEscalaBimestre({
+      plantoes,
+      ordemVetInicial: ORDEM_VET_PADRAO,
+      ordemTecInicial: [],
+      afastamentosFlat: afs,
+    });
+    const letra = (ds) => LETRA_VET[plantoes.find((p) => p.dataReferencia === ds).usuarioId];
+    const julPleno = pleno.alocacoes.filter((a) => a.dataIso.startsWith('2026-07')).map((a) => LETRA_VET[a.usuarioId]).join('');
+    expect(DATAS_JUL_VET.map(letra).join('')).toBe(julPleno);
+    expect(DATAS_JUL_VET.map(letra).join('')).not.toBe('BCDEFGAH');
   });
 
   test('usuarioIndisponivelParaPlantaoNoDia inclui bloqueio retroativo', () => {

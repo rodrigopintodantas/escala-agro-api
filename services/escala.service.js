@@ -2633,7 +2633,7 @@ function derivarOrdemVetRodizioConsistenteComPlantoes({
       if (cmp !== 0) return cmp;
       return Number(a.vagaIndice ?? 0) - Number(b.vagaIndice ?? 0);
     });
-  /** Só junho na fila interna; julho vem do espelho do mês anterior (evita BCDEFHAG e fila errada). */
+  /** Com `dataLimiteRotacaoIso` (ex. 01/07): só plantões anteriores; sem limite (escala bimestral): todos os dias. */
   const plantoesVet = dataLimiteRotacaoIso
     ? plantoesVetTodos.filter((p) => dataReferenciaParaStr(p.dataReferencia) < dataLimiteRotacaoIso)
     : plantoesVetTodos;
@@ -2725,6 +2725,89 @@ function derivarOrdemVetRodizioConsistenteComPlantoes({
 function mesIsoDeDataReferencia(dataIso) {
   const s = String(dataIso || '');
   return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : '';
+}
+
+/** Mesma regra do cadastro (máx. dois meses fechados): junho+julho = uma linha de plantões. */
+function escalaCobreNoMaximoDoisMeses(dataInicioStr, dataFimStr) {
+  const mesIni = mesIsoDeDataReferencia(dataInicioStr);
+  const mesFim = mesIsoDeDataReferencia(dataFimStr);
+  if (!mesIni || !mesFim || mesIni > mesFim) return false;
+  const [y0, m0] = mesIni.split('-').map(Number);
+  const [y1, m1] = mesFim.split('-').map(Number);
+  const diffMeses = (y1 - y0) * 12 + (m1 - m0);
+  return diffMeses >= 0 && diffMeses <= 1;
+}
+
+/**
+ * Recalendário pleno em escala bimestral: todos os fins de semana em ordem cronológica
+ * (equivalente a duas escalas mensais seguidas, sem espelhar julho em cima de junho).
+ */
+function sincronizarCalendarioRodizioPlenoEscalaBimestre({
+  plantoes,
+  ordemVetInicial,
+  ordemTecInicial,
+  afastamentosFlat,
+  datasNaoUteisIsoSet = new Set(),
+}) {
+  let atualizados = 0;
+  const afList = afastamentosFlat || [];
+
+  const datasVet = [
+    ...new Set(
+      plantoes
+        .filter((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO)
+        .map((p) => dataReferenciaParaStr(p.dataReferencia))
+        .filter(Boolean),
+    ),
+  ].sort();
+  if (datasVet.length && Array.isArray(ordemVetInicial) && ordemVetInicial.length) {
+    const ordemVet = normalizarOrdemRodizioCompleta(ordemVetInicial, ordemVetInicial);
+    const simVet = simularRodizioVetPlantoes(ordemVet, datasVet, afList, datasNaoUteisIsoSet);
+    for (const aloc of simVet.alocacoes || []) {
+      const pl = plantoes.find(
+        (p) =>
+          categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO &&
+          dataReferenciaParaStr(p.dataReferencia) === aloc.dataIso,
+      );
+      if (!pl) continue;
+      const alvo = Number(aloc.usuarioId);
+      if (Number.isFinite(alvo) && alvo > 0 && Number(pl.usuarioId) !== alvo) {
+        pl.usuarioId = alvo;
+        pl.observacao = null;
+        atualizados += 1;
+      }
+    }
+  }
+
+  const datasTec = [
+    ...new Set(
+      plantoes
+        .filter((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.TECNICO)
+        .map((p) => dataReferenciaParaStr(p.dataReferencia))
+        .filter(Boolean),
+    ),
+  ].sort();
+  if (datasTec.length && Array.isArray(ordemTecInicial) && ordemTecInicial.length) {
+    const ordemTec = normalizarOrdemRodizioCompleta(ordemTecInicial, ordemTecInicial);
+    const simTec = simularRodizioTecPlantoes(ordemTec, datasTec, afList, datasNaoUteisIsoSet);
+    for (const aloc of simTec.alocacoes || []) {
+      const pl = plantoes.find(
+        (p) =>
+          categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.TECNICO &&
+          dataReferenciaParaStr(p.dataReferencia) === aloc.dataIso &&
+          Number(p.vagaIndice) === Number(aloc.vagaIndice),
+      );
+      if (!pl) continue;
+      const alvo = Number(aloc.usuarioId);
+      if (Number.isFinite(alvo) && alvo > 0 && Number(pl.usuarioId) !== alvo) {
+        pl.usuarioId = alvo;
+        pl.observacao = null;
+        atualizados += 1;
+      }
+    }
+  }
+
+  return { atualizados };
 }
 
 function mesIsoAnteriorDeDataLimite(dataLimiteIso) {
@@ -3108,6 +3191,8 @@ function simularRodizioTecModoFocado({
   ordemReferenciaPleno = null,
   /** Ordem AABB do histórico `inicial` — referência do rodízio pleno (preferível a `ordemReferenciaPleno`). */
   ordemCicloReferencia = null,
+  /** Escala bimestral (máx. 2 meses): sem espelho / corte no 1º dia do mês seguinte ao fim do afastamento. */
+  rodizioContinuo = false,
 }) {
   const ordemEntradaFocado = [...ordemInicial];
   const ordemPlenoRef =
@@ -3146,7 +3231,8 @@ function simularRodizioTecModoFocado({
   );
   const filaRetornosFeriasPendentes = [];
   const primeiroUsuarioNoDiaTech = new Map();
-  const dataLimitePuloFocado = fimAfastamentoIso ? primeiroDiaMesSeguinte(fimAfastamentoIso) : null;
+  const dataLimitePuloFocado =
+    fimAfastamentoIso && !rodizioContinuo ? primeiroDiaMesSeguinte(fimAfastamentoIso) : null;
   const tipoFocadoSim =
     (afastamentosFlat || []).find((a) => Number(a.usuarioId) === uid)?.tipo?.tipo || 'Abono';
   const afFocadoPlainSim = {
@@ -3642,6 +3728,8 @@ async function recalcularEscalaInterno(
   }
   const dataInicioStr = dataReferenciaParaStr(escala.dataInicio);
   const dataFimStr = dataReferenciaParaStr(escala.dataFim);
+  /** Junho+julho na mesma escala: rodízio contínuo, sem espelhar o 2º mês no 1º. */
+  const rodizioContinuoEscala = escalaCobreNoMaximoDoisMeses(dataInicioStr, dataFimStr);
 
   const membros = await obterMembrosAtivosEscala(escalaId, transaction);
   const ordemAtualDbInicialVet = membros
@@ -3952,7 +4040,9 @@ async function recalcularEscalaInterno(
     const fimAfIso = dataReferenciaParaStr(afFocado.dataFim);
     if (fimAfIso) {
       fimIsoAbonoFocado = fimAfIso;
-      dataLimitePuloFocado = primeiroDiaMesSeguinte(fimAfIso);
+      if (!rodizioContinuoEscala) {
+        dataLimitePuloFocado = primeiroDiaMesSeguinte(fimAfIso);
+      }
     }
   }
   const idxState = { idxVet: 0, idxTec: 0 };
@@ -4659,7 +4749,31 @@ async function recalcularEscalaInterno(
   const focalEhTec =
     afFocadoPlain && ordemAtualDbInicialTec.includes(Number(afFocadoPlain.usuarioId));
 
+  if (rodizioContinuoEscala && modoRecalculoFocado) {
+    const afListPleno = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+    const ordemVetPleno =
+      ordemCicloRefVet.length > 0 ? ordemCicloRefVet : ordemAtualDbInicialVet;
+    const ordemTecPleno =
+      ordemCicloRefTec.length > 0 ? ordemCicloRefTec : ordemAtualDbInicialTec;
+    const resPlenoBimestre = sincronizarCalendarioRodizioPlenoEscalaBimestre({
+      plantoes,
+      ordemVetInicial: ordemVetPleno,
+      ordemTecInicial: ordemTecPleno,
+      afastamentosFlat: afListPleno,
+      datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+    });
+    if (resPlenoBimestre.atualizados > 0) {
+      for (const p of plantoes) {
+        if (typeof p.save === 'function') {
+          await p.save({ transaction });
+        }
+      }
+      atualizados += resPlenoBimestre.atualizados;
+    }
+  }
+
   if (
+    !rodizioContinuoEscala &&
     modoRecalculoFocado &&
     afFocadoPlain &&
     (afastamentoEhAbono(afFocadoPlain) || afastamentoEhFerias(afFocadoPlain)) &&
@@ -4733,6 +4847,7 @@ async function recalcularEscalaInterno(
   }
 
   if (
+    !rodizioContinuoEscala &&
     modoRecalculoFocado &&
     afFocadoPlain &&
     (afastamentoEhAbono(afFocadoPlain) || afastamentoEhFerias(afFocadoPlain)) &&
@@ -6730,6 +6845,8 @@ EscalaService.__testables = {
   existeDiaUtilNoIntervalo,
   adicionarDiasIso,
   primeiroDiaMesSeguinte,
+  escalaCobreNoMaximoDoisMeses,
+  sincronizarCalendarioRodizioPlenoEscalaBimestre,
   obterIdxRodizioAposUltimoPlantaoAntesDe,
   usuarioRetornoFeriasAbonoJaRealizadoAntesDe,
   sincronizarIdxOrdemDePlantoes,
