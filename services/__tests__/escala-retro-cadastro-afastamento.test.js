@@ -34,6 +34,7 @@ describe('Afastamento férias/abono — retroativo ao cadastro', () => {
     primeiroDiaMesSeguinte,
     escalaCobreNoMaximoDoisMeses,
     sincronizarCalendarioRodizioPlenoEscalaBimestre,
+    ordemVetPersistidaBimestreFocado,
     obterIdxRodizioAposUltimoPlantaoAntesDe,
     usuarioRetornoFeriasAbonoJaRealizadoAntesDe,
     normalizarOrdemRodizioCompleta,
@@ -686,6 +687,76 @@ describe('Afastamento férias/abono — retroativo ao cadastro', () => {
     const julSeq = DATAS_JUL_VET.map(letra).join('');
     expect(julSeq).toBe(junSeq);
     expect(julSeq).not.toBe('BCDEFGAH');
+  });
+
+  test('Ana férias + abono Diego 12/06 bimestre: ordem global BCEFDGAH (limite rotação 01/07)', () => {
+    const DATAS_JUL_VET = [
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afs = [
+      { usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+      { usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
+    ];
+    const pleno = simularRodizioVetPlantoes(ORDEM_VET_PADRAO, [...DATAS_JUN_VET, ...DATAS_JUL_VET], afs);
+    const plantoes = pleno.alocacoes.map((a) => ({
+      dataReferencia: a.dataIso,
+      categoriaPlantao: 'veterinario',
+      usuarioId: a.usuarioId,
+    }));
+    const rebApi = ordemVetPersistidaBimestreFocado({
+      plantoes,
+      ordemBaseVet: ORDEM_VET_PADRAO,
+      afastamentosFlat: afs,
+      fimIsoAfastamentoFocado: '2026-06-12',
+    });
+    const seq = (ids) => ids.map((id) => LETRA_VET[id]).join('');
+    expect(seq(rebApi.ordemPersistida)).toBe('BCEFDGAH');
+    expect(rebApi.ordemPersistida[0]).toBe(102);
+  });
+
+  test('abono Elisa 10/07 após Ana+Diego+Gabriela férias jun: ordem global BCFDEHAG (escala bimestre)', () => {
+    const DATAS_JUL_VET = [
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afs = [
+      { usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+      { usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
+      { usuarioId: 107, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-17', dataFim: '2026-06-24' },
+      { usuarioId: 105, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-10', dataFim: '2026-07-10' },
+    ];
+    const pleno = simularRodizioVetPlantoes(ORDEM_VET_PADRAO, [...DATAS_JUN_VET, ...DATAS_JUL_VET], afs);
+    expect(DATAS_JUL_VET.map((d) => LETRA_VET[pleno.alocacoes.find((a) => a.dataIso === d).usuarioId]).join('')).toBe(
+      'BCFDEHAG',
+    );
+    const plantoes = pleno.alocacoes.map((a) => ({
+      dataReferencia: a.dataIso,
+      categoriaPlantao: 'veterinario',
+      usuarioId: a.usuarioId,
+    }));
+    const rebApi = ordemVetPersistidaBimestreFocado({
+      plantoes,
+      ordemBaseVet: ORDEM_VET_PADRAO,
+      afastamentosFlat: afs,
+      fimIsoAfastamentoFocado: '2026-07-10',
+    });
+    const seq = (ids) => ids.map((id) => LETRA_VET[id]).join('');
+    expect(seq(rebApi.ordemPersistida)).toBe('BCFDEHAG');
+    expect(rebApi.ordemPersistida[0]).toBe(102);
+    expect(rebApi.ordemPersistida[0]).not.toBe(101);
   });
 
   test('abono Elisa 10/07 após Ana+Daniel+Gabriela férias: jul BCFDEHAG (não corromper espelho)', () => {

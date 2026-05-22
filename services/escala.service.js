@@ -2810,6 +2810,54 @@ function sincronizarCalendarioRodizioPlenoEscalaBimestre({
   return { atualizados };
 }
 
+/**
+ * Fila global em escala bimestral: sempre via `simularRodizioVetPlantoes` (linha do tempo contínua).
+ * - Afastamento em jun (ex.: Diego): só fins de semana &lt; 01/07 → BCEFDGAH.
+ * - Afastamento em jul (ex.: Elisa): todos os fins de semana jun+jul → BCFDEHAG (não replay/derivar).
+ */
+function ordemVetPersistidaBimestreFocado({
+  plantoes,
+  ordemBaseVet,
+  afastamentosFlat,
+  fimIsoAfastamentoFocado,
+  datasNaoUteisIsoSet = new Set(),
+}) {
+  const ordemBase = normalizarOrdemRodizioCompleta(ordemBaseVet, ordemBaseVet);
+  if (!ordemBase.length) {
+    return { ordemAtual: [], ordemPersistida: [], idxOrdem: 0 };
+  }
+  const datasVet = [
+    ...new Set(
+      plantoes
+        .filter((p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO)
+        .map((p) => dataReferenciaParaStr(p.dataReferencia))
+        .filter(Boolean),
+    ),
+  ].sort();
+  const dataLimiteRotacao = fimIsoAfastamentoFocado
+    ? primeiroDiaMesSeguinte(fimIsoAfastamentoFocado)
+    : null;
+  const ultimaDataVet = datasVet.length ? datasVet[datasVet.length - 1] : null;
+  const afastamentoAntesDoUltimoMesDaEscala = Boolean(
+    dataLimiteRotacao &&
+      fimIsoAfastamentoFocado &&
+      ultimaDataVet &&
+      mesIsoDeDataReferencia(fimIsoAfastamentoFocado) < mesIsoDeDataReferencia(ultimaDataVet),
+  );
+  const datasSimulacao = afastamentoAntesDoUltimoMesDaEscala
+    ? datasVet.filter((ds) => ds < dataLimiteRotacao)
+    : datasVet;
+  if (!datasSimulacao.length) {
+    return { ordemAtual: [...ordemBase], ordemPersistida: [...ordemBase], idxOrdem: 0 };
+  }
+  return simularRodizioVetPlantoes(
+    ordemBase,
+    datasSimulacao,
+    afastamentosFlat,
+    datasNaoUteisIsoSet,
+  );
+}
+
 function mesIsoAnteriorDeDataLimite(dataLimiteIso) {
   const mes = mesIsoDeDataReferencia(dataLimiteIso);
   if (!/^\d{4}-\d{2}$/.test(mes)) return '';
@@ -4975,21 +5023,39 @@ async function recalcularEscalaInterno(
     ordemAtualDbInicialVet.includes(Number(afFocadoPlain.usuarioId));
   if (abonoFocadoReconstruirOrdemTec) {
     const afList = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
-    const reb = derivarOrdemTecRodizioConsistenteComPlantoes({
-      plantoes,
-      ordemBase:
-        ordemCicloRefTec.length > 0
-          ? ordemCicloRefTec
-          : ordemAtualDbInicialTec.length
-            ? ordemAtualDbInicialTec
-            : ordemAtualTec,
-      afastamentosLista: afList,
-      datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
-    });
-    if (reb.ordemAtual.length > 0) {
-      ordemAtualTec = reb.ordemAtual;
-      ordemGlobalTec = reb.ordemPersistida.length ? reb.ordemPersistida : [...reb.ordemAtual];
-      idxOrdemTec = reb.idxOrdem;
+    const ordemRefTec =
+      ordemCicloRefTec.length > 0
+        ? ordemCicloRefTec
+        : ordemAtualDbInicialTec.length
+          ? ordemAtualDbInicialTec
+          : ordemAtualTec;
+    const ordemBaseTec = normalizarOrdemRodizioCompleta(ordemRefTec, ordemRefTec);
+    if (rodizioContinuoEscala) {
+      const rebTecBimestre = derivarOrdemTecRodizioConsistenteComPlantoes({
+        plantoes,
+        ordemBase: ordemBaseTec,
+        afastamentosLista: afList,
+        datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+      });
+      if (rebTecBimestre.ordemAtual.length > 0) {
+        ordemAtualTec = rebTecBimestre.ordemAtual;
+        ordemGlobalTec = rebTecBimestre.ordemPersistida.length
+          ? rebTecBimestre.ordemPersistida
+          : [...rebTecBimestre.ordemAtual];
+        idxOrdemTec = rebTecBimestre.idxOrdem;
+      }
+    } else {
+      const reb = derivarOrdemTecRodizioConsistenteComPlantoes({
+        plantoes,
+        ordemBase: ordemBaseTec,
+        afastamentosLista: afList,
+        datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+      });
+      if (reb.ordemAtual.length > 0) {
+        ordemAtualTec = reb.ordemAtual;
+        ordemGlobalTec = reb.ordemPersistida.length ? reb.ordemPersistida : [...reb.ordemAtual];
+        idxOrdemTec = reb.idxOrdem;
+      }
     }
   }
   if (afastamentoFocadoReconstruirOrdemVet) {
@@ -5000,22 +5066,37 @@ async function recalcularEscalaInterno(
         : ordemAtualDbInicialVet.length
           ? ordemAtualDbInicialVet
           : ordemAtualVet;
-    /** Como técnicos: fila interna + rotação a partir do calendário gravado após o focalizado. */
-    const rebVet = derivarOrdemVetRodizioConsistenteComPlantoes({
-      plantoes,
-      ordemBase: normalizarOrdemRodizioCompleta(
-        ordemAtualVet.length ? ordemAtualVet : ordemRefVet,
-        ordemRefVet,
-      ),
-      afastamentosLista: afList,
-      datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
-      modo: 'replay',
-      dataLimiteRotacaoIso: dataLimitePuloFocado || null,
-    });
-    if (rebVet.ordemPersistida.length > 0) {
-      ordemAtualVet = rebVet.ordemAtual;
-      ordemGlobalVet = [...rebVet.ordemPersistida];
-      idxOrdemVet = rebVet.idxOrdem;
+    const ordemBaseVet = normalizarOrdemRodizioCompleta(ordemRefVet, ordemRefVet);
+    if (rodizioContinuoEscala) {
+      const rebVetBimestre = ordemVetPersistidaBimestreFocado({
+        plantoes,
+        ordemBaseVet,
+        afastamentosFlat: afList,
+        fimIsoAfastamentoFocado: fimIsoAbonoFocado,
+        datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+      });
+      if (rebVetBimestre.ordemPersistida.length > 0) {
+        ordemAtualVet = rebVetBimestre.ordemAtual;
+        ordemGlobalVet = [...rebVetBimestre.ordemPersistida];
+        idxOrdemVet = rebVetBimestre.idxOrdem;
+      }
+    } else {
+      const rebVet = derivarOrdemVetRodizioConsistenteComPlantoes({
+        plantoes,
+        ordemBase: normalizarOrdemRodizioCompleta(
+          ordemAtualVet.length ? ordemAtualVet : ordemRefVet,
+          ordemRefVet,
+        ),
+        afastamentosLista: afList,
+        datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
+        modo: 'replay',
+        dataLimiteRotacaoIso: dataLimitePuloFocado || null,
+      });
+      if (rebVet.ordemPersistida.length > 0) {
+        ordemAtualVet = rebVet.ordemAtual;
+        ordemGlobalVet = [...rebVet.ordemPersistida];
+        idxOrdemVet = rebVet.idxOrdem;
+      }
     }
   } else {
     ordemAtualVet = rotacionarOrdemParaProximoPreferencial(ordemAtualVet, idxOrdemVet);
@@ -5026,12 +5107,23 @@ async function recalcularEscalaInterno(
     ordemGlobalTec = rotacionarOrdemParaProximoPreferencial(ordemGlobalTec, idxOrdemTec);
   }
 
-  /** Mantém ordem global alinhada à fila do rodízio da escala quando esta mudou (ex.: 2º afastamento focalizado). */
+  /**
+   * Mantém ordem global alinhada à fila do rodízio da escala quando esta mudou.
+   * Se a fila veio do replay/simulação plena, não sobrescrever com `ordemAtual` suja do loop focalizado.
+   */
   if (ordemAtualVet.join(',') !== ordemGlobalVet.join(',')) {
-    ordemGlobalVet = [...ordemAtualVet];
+    if (afastamentoFocadoReconstruirOrdemVet) {
+      ordemAtualVet = [...ordemGlobalVet];
+    } else {
+      ordemGlobalVet = [...ordemAtualVet];
+    }
   }
   if (ordemAtualTec.join(',') !== ordemGlobalTec.join(',')) {
-    ordemGlobalTec = [...ordemAtualTec];
+    if (abonoFocadoReconstruirOrdemTec) {
+      ordemAtualTec = [...ordemGlobalTec];
+    } else {
+      ordemGlobalTec = [...ordemAtualTec];
+    }
   }
 
   const ordemMudouVet = ordemAtualVet.join(',') !== ordemAtualDbInicialVet.join(',');
@@ -6847,6 +6939,7 @@ EscalaService.__testables = {
   primeiroDiaMesSeguinte,
   escalaCobreNoMaximoDoisMeses,
   sincronizarCalendarioRodizioPlenoEscalaBimestre,
+  ordemVetPersistidaBimestreFocado,
   obterIdxRodizioAposUltimoPlantaoAntesDe,
   usuarioRetornoFeriasAbonoJaRealizadoAntesDe,
   sincronizarIdxOrdemDePlantoes,
