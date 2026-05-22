@@ -5019,6 +5019,50 @@ async function refreshSnapshotsOrdemDeAfastamentosRestantes(transaction, afastam
   }
 }
 
+/**
+ * Restaura a ordem geral (veterinários e técnicos) ao snapshot gravado em `motivo: 'inicial'` na criação da escala.
+ */
+async function restaurarOrdemGlobalPreExclusaoEscala(escalaId, transaction) {
+  const histsInicial = await EscalaOrdemHistoricoModel.findAll({
+    where: { escalaId: Number(escalaId), motivo: 'inicial' },
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  let ordemGlobalInicialVet = null;
+  let ordemGlobalInicialTec = null;
+  for (const histInicial of histsInicial) {
+    const plain = histInicial.get ? histInicial.get({ plain: true }) : histInicial;
+    const cat =
+      String(plain.categoriaOrdem || '').toLowerCase() === CATEGORIA_MEMBRO.TECNICO
+        ? CATEGORIA_MEMBRO.TECNICO
+        : CATEGORIA_MEMBRO.VETERINARIO;
+    if (!Array.isArray(plain.ordemGlobalUsuarioIds) || plain.ordemGlobalUsuarioIds.length === 0) continue;
+    const og = plain.ordemGlobalUsuarioIds.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0);
+    if (og.length === 0) continue;
+    if (cat === CATEGORIA_MEMBRO.TECNICO) ordemGlobalInicialTec = og;
+    else ordemGlobalInicialVet = og;
+  }
+  if (ordemGlobalInicialVet && ordemGlobalInicialVet.length > 0) {
+    await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicialVet, transaction, ESCOPO_ORDEM.VETERINARIO);
+  }
+  if (ordemGlobalInicialTec && ordemGlobalInicialTec.length > 0) {
+    await atualizarOrdemServidoresGlobalSemColisao(ordemGlobalInicialTec, transaction, ESCOPO_ORDEM.TECNICO);
+  }
+  if (!ordemGlobalInicialVet?.length && !ordemGlobalInicialTec?.length) return;
+
+  const afastamentos = await AfastamentoModel.findAll({ attributes: ['id', 'usuarioId'], transaction });
+  for (const af of afastamentos) {
+    const escopoAf = await escopoOrdemGlobalParaUsuarioId(af.usuarioId, transaction);
+    const og = await obterOrdemGlobalUsuarioIds(transaction, escopoAf);
+    if (og.length > 0) {
+      await AfastamentoModel.update(
+        { ordemGlobalUsuarioIdsAntes: og },
+        { where: { id: Number(af.id) }, transaction },
+      );
+    }
+  }
+}
+
 async function restaurarOrdemEGlobalAntesDesfazerAfastamento(afastamentoPlain, transaction) {
   const afId = Number(afastamentoPlain.id);
   if (!Number.isFinite(afId)) return;
@@ -6623,8 +6667,10 @@ const EscalaService = {
     const escala = await EscalaModel.findByPk(id);
     if (!escala) return false;
     await sequelizeTransaction(async (t) => {
+      await restaurarOrdemGlobalPreExclusaoEscala(id, t);
       await PermutaSolicitacaoModel.destroy({ where: { escalaId: id }, transaction: t });
       await PlantaoModel.destroy({ where: { escalaId: id }, transaction: t });
+      await EscalaAuditoriaEventoModel.destroy({ where: { escalaId: id }, transaction: t });
       await EscalaOrdemHistoricoModel.destroy({ where: { escalaId: id }, transaction: t });
       await ImpedimentoModel.destroy({ where: { escalaId: id }, transaction: t });
       await EscalaMembroModel.destroy({ where: { escalaId: id }, transaction: t });
@@ -6669,6 +6715,7 @@ EscalaService.__testables = {
   simularRodizioTecModoFocado,
   corrigirDuplicatasTecnicosMesmoDia,
   textoGestaoDataAdicionalPlantao,
+  restaurarOrdemGlobalPreExclusaoEscala,
 };
 
 module.exports = EscalaService;
