@@ -12,6 +12,8 @@
     "db:seed": "sequelize-cli db:seed:all",
     "db:create": "sequelize-cli db:create",
     "db:drop": "sequelize-cli db:drop",
+    "desenvolvimento_escala": "node scripts/desenvolvimento_escala.js",
+    "producao_escala": "node scripts/producao_escala.js",
     "test": "NODE_ENV=test jest"
   },
   "dependencies": {

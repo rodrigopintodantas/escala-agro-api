@@ -1,68 +1,19 @@
 const sequelizeTransaction = require('../auth/sequelize-transaction');
-
-const TABELAS_RESET = [
-  'permuta_solicitacao',
-  'impedimento',
-  'afastamento',
-  'escala_auditoria_evento',
-  'escala_ordem_historico',
-  'plantao',
-  'escala_membro',
-  'escala',
-];
-
-async function contarTabela(sequelize, tabela, transaction) {
-  const [rows] = await sequelize.query(`SELECT COUNT(*)::int AS total FROM ${tabela}`, { transaction });
-  return Number(rows?.[0]?.total || 0);
-}
-
-async function reconstruirOrdemServidorInicial(sequelize, transaction) {
-  await sequelize.query(`DELETE FROM ordem_servidor`, { transaction });
-
-  await sequelize.query(
-    `
-      INSERT INTO ordem_servidor (usuario_id, ordem, escopo, "createdAt", "updatedAt")
-      SELECT
-        x.usuario_id,
-        ROW_NUMBER() OVER (ORDER BY x.nome ASC),
-        'veterinario',
-        NOW(),
-        NOW()
-      FROM (
-        SELECT DISTINCT u.id AS usuario_id, u.nome
-        FROM usuario u
-        JOIN usuario_papel up ON up.usuario_id = u.id
-        JOIN papel p ON p.id = up.papel_id
-        WHERE u.ativo = true
-          AND p.nome IN ('Veterinário', 'Veterinario')
-      ) x
-      ORDER BY x.nome ASC
-    `,
-    { transaction },
-  );
-
-  await sequelize.query(
-    `
-      INSERT INTO ordem_servidor (usuario_id, ordem, escopo, "createdAt", "updatedAt")
-      SELECT
-        x.usuario_id,
-        ROW_NUMBER() OVER (ORDER BY x.nome ASC),
-        'tecnico',
-        NOW(),
-        NOW()
-      FROM (
-        SELECT DISTINCT u.id AS usuario_id, u.nome
-        FROM usuario u
-        JOIN usuario_papel up ON up.usuario_id = u.id
-        JOIN papel p ON p.id = up.papel_id
-        WHERE u.ativo = true
-          AND p.nome IN ('Técnico', 'Tecnico')
-      ) x
-      ORDER BY x.nome ASC
-    `,
-    { transaction },
-  );
-}
+const { executarCargaEscalaUsuarios } = require('./carga-escala-usuarios.service');
+const {
+  TABELAS_RESET,
+  contarTabela,
+  normalizarOrdemGlobalTecnico,
+  reconstruirOrdemServidorInicial,
+} = require('./sistema-ordem.service');
+const {
+  SENHA_PADRAO_DESENVOLVIMENTO,
+  listarTodos: listarUsuariosDesenvolvimento,
+} = require('../scripts/dados/usuarios-desenvolvimento');
+const {
+  SENHA_PADRAO_PRODUCAO,
+  listarTodos: listarUsuariosProducao,
+} = require('../scripts/dados/usuarios-producao');
 
 const SistemaService = {
   reiniciarTeste: async () => {
@@ -79,6 +30,7 @@ const SistemaService = {
       );
 
       await reconstruirOrdemServidorInicial(db.sequelize, t);
+      await normalizarOrdemGlobalTecnico(db.sequelize, t);
 
       const ordemServidor = await contarTabela(db.sequelize, 'ordem_servidor', t);
       return {
@@ -88,7 +40,27 @@ const SistemaService = {
       };
     });
   },
+
+  carregarDesenvolvimento: async () => {
+    const db = require('../models');
+    return executarCargaEscalaUsuarios(db.sequelize, {
+      conjunto: 'desenvolvimento',
+      definicoes: listarUsuariosDesenvolvimento(),
+      senhaPadrao: SENHA_PADRAO_DESENVOLVIMENTO,
+    });
+  },
+
+  carregarProducao: async () => {
+    const db = require('../models');
+    return executarCargaEscalaUsuarios(db.sequelize, {
+      conjunto: 'producao',
+      definicoes: listarUsuariosProducao(),
+      senhaPadrao: SENHA_PADRAO_PRODUCAO,
+    });
+  },
 };
 
 module.exports = SistemaService;
-
+module.exports.TABELAS_RESET = TABELAS_RESET;
+module.exports.reconstruirOrdemServidorInicial = reconstruirOrdemServidorInicial;
+module.exports.normalizarOrdemGlobalTecnico = normalizarOrdemGlobalTecnico;
