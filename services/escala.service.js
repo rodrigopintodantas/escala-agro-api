@@ -3942,6 +3942,8 @@ async function recalcularEscalaInterno(
   let idxSincronizadoParaMesSeguinte = false;
   let afFocadoPlain = null;
   let fimIsoAbonoFocado = null;
+  /** Abono com limite 01/08 quando anteriores pararam em 01/07 (ex.: Elisa); não quando limite repete (ex.: Daniel após Ana). */
+  let limiteMesNovoAposAnterioresVet = false;
   if (modoRecalculoFocado) {
     const afFocado = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
     afFocadoPlain = afFocado;
@@ -3984,6 +3986,19 @@ async function recalcularEscalaInterno(
           .filter((a) => Number(a.id) !== Number(historicoAfastamento.id))
           .map((a) => (a.get ? a.get({ plain: true }) : a))
       : [];
+
+  if (
+    modoRecalculoFocado &&
+    afFocadoPlain &&
+    afastamentoEhAbono(afFocadoPlain) &&
+    outrosAfastamentosFocado.length > 0 &&
+    dataLimitePuloFocado
+  ) {
+    limiteMesNovoAposAnterioresVet = !outrosAfastamentosFocado.some((a) => {
+      const fimO = dataReferenciaParaStr(a.dataFim);
+      return fimO && primeiroDiaMesSeguinte(fimO) === dataLimitePuloFocado;
+    });
+  }
 
   if (modoRecalculoFocado && usuarioAfetadoRecalculoId != null) {
     const datasRelevantes = plantoes
@@ -4311,11 +4326,33 @@ async function recalcularEscalaInterno(
         (a) => Number(a.usuarioId) === uidR && afastamentoEhAbono(a),
       );
     });
+    /**
+     * Abono vet com limite em mês novo (ex.: Elisa 10/07 → 01/08 após afastamentos com limite 01/07):
+     * julho já espelhado; o loop focalizado corrompe fins de semana — só realinha via pleno no fim.
+     * Não aplicar quando o limite repete o dos anteriores (ex.: Daniel 12/06 após Ana → 01/07): junho
+     * ainda precisa do recálculo focal antes de espelhar julho.
+     */
+    const inicioIsoAbonoFocadoLoop = afFocadoPlain
+      ? dataReferenciaParaStr(afFocadoPlain.dataInicio)
+      : null;
+    const vetAbonoPreservarMesParaPleno =
+      aplicarModoFocadoNoPlantao &&
+      catPlantao === CATEGORIA_PLANTAO.VETERINARIO &&
+      afFocadoPlain &&
+      afastamentoEhAbono(afFocadoPlain) &&
+      temAfastamentoAnteriorNoFoco &&
+      limiteMesNovoAposAnterioresVet &&
+      dataLimitePuloFocado &&
+      fimIsoAbonoFocado &&
+      inicioIsoAbonoFocadoLoop &&
+      mesIsoDeDataReferencia(dataIso) === mesIsoDeDataReferencia(inicioIsoAbonoFocadoLoop) &&
+      dataIso > fimIsoAbonoFocado &&
+      dataIso < dataLimitePuloFocado;
     const podePularPlantaoNoModoFocado =
       aplicarModoFocadoNoPlantao &&
       usuarioAfetadoRecalculoId != null &&
-      !plantaoExigeRecalculoFocado &&
-      retornosRelevantesFocado.length === 0;
+      (vetAbonoPreservarMesParaPleno ||
+        (!plantaoExigeRecalculoFocado && retornosRelevantesFocado.length === 0));
 
     if (podePularPlantaoNoModoFocado) {
       const duplicataTecVaga1 =
@@ -4751,6 +4788,26 @@ async function recalcularEscalaInterno(
     }
     if (afastamentoEhAbono(afFocadoPlain) && dataSeguinteVet) {
       diasAlinharVet.add(dataSeguinteVet);
+    }
+    if (
+      afastamentoEhAbono(afFocadoPlain) &&
+      limiteMesNovoAposAnterioresVet &&
+      dataLimitePuloFocado &&
+      inicioIsoAlinharVet
+    ) {
+      const fimIsoVetAbono =
+        dataReferenciaParaStr(afFocadoPlain.dataFim) || inicioIsoAlinharVet;
+      const mesAbono = mesIsoDeDataReferencia(inicioIsoAlinharVet);
+      for (const ds of datasPlantoesVetOrdenadas) {
+        if (
+          fimIsoVetAbono &&
+          ds > fimIsoVetAbono &&
+          ds < dataLimitePuloFocado &&
+          mesIsoDeDataReferencia(ds) === mesAbono
+        ) {
+          diasAlinharVet.add(ds);
+        }
+      }
     }
     for (const dsAlinhar of diasAlinharVet) {
       const resAlinharVet = alinharPlantaoVetDiaComRodizioPleno({

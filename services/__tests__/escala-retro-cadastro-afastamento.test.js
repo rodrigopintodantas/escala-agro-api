@@ -616,6 +616,85 @@ describe('Afastamento férias/abono — retroativo ao cadastro', () => {
     expect(reb.ordemPersistida.indexOf(105)).toBeGreaterThan(reb.ordemPersistida.indexOf(104));
   });
 
+  test('Ana férias + abono Daniel 12/06: jul espelha junho corrigido (BCEFDHAG), não BCDEFGAH', () => {
+    const DATAS_JUL_VET = [
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afs = [
+      { usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+      { usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
+    ];
+    const pleno = simularRodizioVetPlantoes(ORDEM_VET_PADRAO, [...DATAS_JUN_VET, ...DATAS_JUL_VET], afs);
+    const letra = (ds) => LETRA_VET[pleno.alocacoes.find((a) => a.dataIso === ds).usuarioId];
+    const junSeq = DATAS_JUN_VET.map(letra).join('');
+    const julSeq = DATAS_JUL_VET.map(letra).join('');
+    expect(julSeq).toBe(junSeq);
+    expect(julSeq).not.toBe('BCDEFGAH');
+  });
+
+  test('abono Elisa 10/07 após Ana+Daniel+Gabriela férias: jul BCFDEHAG (não corromper espelho)', () => {
+    const DATAS_JUL_VET = [
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afs = [
+      { usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+      { usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' },
+      { usuarioId: 107, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-17', dataFim: '2026-06-24' },
+      { usuarioId: 105, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-10', dataFim: '2026-07-10' },
+    ];
+    const pleno = simularRodizioVetPlantoes(ORDEM_VET_PADRAO, [...DATAS_JUN_VET, ...DATAS_JUL_VET], afs);
+    const letra = (ds) => LETRA_VET[pleno.alocacoes.find((a) => a.dataIso === ds).usuarioId];
+    expect(DATAS_JUL_VET.map(letra).join('')).toBe('BCFDEHAG');
+
+    const junPleno = pleno.alocacoes.filter((a) => a.dataIso.startsWith('2026-06'));
+    const julEspelho = DATAS_JUL_VET.map((ds, i) => ({
+      dataReferencia: ds,
+      categoriaPlantao: 'veterinario',
+      usuarioId: junPleno[i].usuarioId,
+    }));
+    const plantoes = [...junPleno, ...julEspelho].map((p) => ({
+      dataReferencia: p.dataIso || p.dataReferencia,
+      categoriaPlantao: 'veterinario',
+      usuarioId: p.usuarioId,
+    }));
+    const fimAbono = '2026-07-10';
+    const diasAlinhar = new Set(
+      DATAS_JUL_VET.filter((ds) => ds > fimAbono && ds < '2026-08-01'),
+    );
+    for (const ds of diasAlinhar) {
+      alinharPlantaoVetDiaComRodizioPleno({
+        plantoes,
+        dataIso: ds,
+        ordemInicial: ORDEM_VET_PADRAO,
+        afastamentosFlat: afs,
+      });
+    }
+    expect(DATAS_JUL_VET.map((ds) => LETRA_VET[plantoes.find((p) => p.dataReferencia === ds).usuarioId]).join('')).toBe(
+      'BCFDEHAG',
+    );
+    const reb = derivarOrdemVetRodizioConsistenteComPlantoes({
+      plantoes,
+      ordemBase: ORDEM_VET_PADRAO,
+      afastamentosLista: afs,
+      dataLimiteRotacaoIso: '2026-08-01',
+    });
+    expect(reb.ordemPersistida[0]).toBe(101);
+  });
+
   test('3º abono vet Gabriela 19/06: recalcula 21, 27 e 28 sem reabrir 13–20', () => {
     const ordem = ORDEM_VET_PADRAO;
     const datasPlantoes = DATAS_JUN_VET;
