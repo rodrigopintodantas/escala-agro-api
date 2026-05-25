@@ -1139,9 +1139,10 @@ async function obterOrdemGlobalUsuarioIds(transaction, escopo = ESCOPO_ORDEM.VET
     escopo === ESCOPO_ORDEM.TECNICO ? await obterPapelTecnico(transaction) : await obterPapelVeterinario(transaction);
   if (!papel) return [];
 
+  const ServidorService = require('./servidor.service');
   const servidores = await UsuarioModel.findAll({
     include: [{ model: UsuarioPapelModel, required: true, where: { PapelModelId: papel.id } }],
-    where: { ativo: true },
+    where: { ativo: true, ...ServidorService.whereNaoAguardandoOrdemEscopo(escopo) },
     attributes: ['id', 'nome'],
     transaction,
   });
@@ -5827,6 +5828,7 @@ const EscalaService = {
     const papelVet = await obterPapelVeterinario();
     if (!papelVet) return [];
 
+    const ServidorService = require('./servidor.service');
     const vets = await UsuarioModel.findAll({
       include: [
         {
@@ -5835,7 +5837,7 @@ const EscalaService = {
           where: { PapelModelId: papelVet.id },
         },
       ],
-      where: { ativo: true },
+      where: { ativo: true, ...ServidorService.whereNaoAguardandoOrdemEscopo(ESCOPO_ORDEM.VETERINARIO) },
       attributes: ['id', 'nome', 'login', 'email', 'cargo'],
     });
     const vetPlain = vets.map((v) => v.get({ plain: true }));
@@ -5865,6 +5867,7 @@ const EscalaService = {
     const papelT = await obterPapelTecnico();
     if (!papelT) return [];
 
+    const ServidorService = require('./servidor.service');
     const tecs = await UsuarioModel.findAll({
       include: [
         {
@@ -5873,7 +5876,7 @@ const EscalaService = {
           where: { PapelModelId: papelT.id },
         },
       ],
-      where: { ativo: true },
+      where: { ativo: true, ...ServidorService.whereNaoAguardandoOrdemEscopo(ESCOPO_ORDEM.TECNICO) },
       attributes: ['id', 'nome', 'login', 'email', 'cargo'],
     });
     const tecPlain = tecs.map((v) => v.get({ plain: true }));
@@ -6018,6 +6021,16 @@ const EscalaService = {
   salvarOrdemServidores: async (usuarioIds, escopoParam = ESCOPO_ORDEM.VETERINARIO) => {
     const escopo =
       String(escopoParam || '').toLowerCase() === ESCOPO_ORDEM.TECNICO ? ESCOPO_ORDEM.TECNICO : ESCOPO_ORDEM.VETERINARIO;
+
+    const escalaBloqueiaOrdem = await EscalaModel.findOne({
+      where: { status: { [Op.in]: ['rascunho', 'ativa'] } },
+      attributes: ['id'],
+    });
+    if (escalaBloqueiaOrdem) {
+      throw new ApiBaseError(
+        'Há escala em rascunho ou ativa. A ordem dos servidores só pode ser alterada quando não houver escalas nesses status.',
+      );
+    }
 
     const ids = Array.isArray(usuarioIds)
       ? [...new Set(usuarioIds.map((x) => parseInt(x, 10)).filter((x) => Number.isFinite(x) && x > 0))]
@@ -6792,6 +6805,10 @@ const EscalaService = {
       await escala.save({ transaction: t });
 
       await cancelarPermutasPendentesEscala(escalaId, t);
+
+      const ServidorService = require('./servidor.service');
+      await ServidorService.promoverAguardandoOrdemGlobal(ESCOPO_ORDEM.VETERINARIO, t);
+      await ServidorService.promoverAguardandoOrdemGlobal(ESCOPO_ORDEM.TECNICO, t);
 
       return escala.get({ plain: true });
     });

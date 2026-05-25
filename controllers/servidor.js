@@ -54,9 +54,29 @@ const reativarVeterinario = async (req, res, next) => {
   }
 };
 
+const criarVeterinario = async (req, res, next) => {
+  try {
+    const resultado = await ServidorService.adicionarServidor('veterinario', req.body);
+    res.status(201).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
+const criarTecnico = async (req, res, next) => {
+  try {
+    const resultado = await ServidorService.adicionarServidor('tecnico', req.body);
+    res.status(201).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   listarVeterinarios,
   listarTecnicos,
+  criarVeterinario,
+  criarTecnico,
   excluirVeterinario,
   excluirTecnico,
   suspenderVeterinario,

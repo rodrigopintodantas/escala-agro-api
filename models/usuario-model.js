@@ -37,6 +37,11 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: false,
         field: 'suspenso_escala',
       },
+      aguardandoOrdemEscopo: {
+        type: DataTypes.STRING(24),
+        allowNull: true,
+        field: 'aguardando_ordem_escopo',
+      },
     },
     { freezeTableName: true, tableName: 'usuario', timestamps: false },
   );
