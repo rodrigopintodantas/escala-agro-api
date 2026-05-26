@@ -2253,6 +2253,272 @@ async function registrarEventoAuditoriaEscala({
 }
 
 /**
+ * Parâmetros para decidir se férias/abono alteram plantões da escala (cadastro irrelevante).
+ */
+function montarParametrosFiltroAfastamentoPlantoes({
+  plantoes,
+  ordemVetInicial,
+  ordemTecInicial,
+  afastamentosLista,
+  periodicidadeEscala,
+  categoriaPorUsuarioId,
+}) {
+  const plantoesNorm = (plantoes || []).map((p) => ({
+    dataReferencia: dataReferenciaParaStr(p.dataReferencia),
+    categoriaPlantao: categoriaPlantaoDe(p),
+    usuarioId: p.usuarioId != null ? Number(p.usuarioId) : undefined,
+    vagaIndice: p.vagaIndice,
+  }));
+  const datasNaoUteisIsoSet =
+    String(periodicidadeEscala || '').toLowerCase() === 'fim_de_semana'
+      ? new Set(
+          plantoesNorm
+            .map((p) => p.dataReferencia)
+            .filter((ds) => !!ds && !ehFimDeSemanaDataReferencia(ds)),
+        )
+      : new Set();
+  return {
+    plantoes: plantoesNorm,
+    ordemVetInicial: [...(ordemVetInicial || [])],
+    ordemTecInicial: [...(ordemTecInicial || [])],
+    afastamentosLista: (afastamentosLista || []).map((a) => (a.get ? a.get({ plain: true }) : a)),
+    periodicidadeEscala,
+    categoriaPorUsuarioId: categoriaPorUsuarioId || new Map(),
+    datasNaoUteisIsoSet,
+  };
+}
+
+function categoriaAfastamentoUsuarioFiltro(params, usuarioId) {
+  const uid = Number(usuarioId);
+  if (params.categoriaPorUsuarioId?.has(uid)) {
+    return params.categoriaPorUsuarioId.get(uid);
+  }
+  return CATEGORIA_PLANTAO.VETERINARIO;
+}
+
+function chaveAlocacaoRodizio(aloc) {
+  if (aloc.vagaIndice != null && aloc.vagaIndice !== undefined) {
+    return `${aloc.dataIso}|${Number(aloc.vagaIndice)}`;
+  }
+  return String(aloc.dataIso);
+}
+
+function mapaAlocacoesRodizio(alocacoes) {
+  const mapa = new Map();
+  for (const a of alocacoes || []) {
+    mapa.set(chaveAlocacaoRodizio(a), Number(a.usuarioId));
+  }
+  return mapa;
+}
+
+function simularAlocacoesRodizioCategoria(params, categoria, afastamentosSubset) {
+  const datas = [
+    ...new Set(
+      params.plantoes
+        .filter((p) => categoriaPlantaoDe(p) === categoria)
+        .map((p) => p.dataReferencia)
+        .filter(Boolean),
+    ),
+  ].sort();
+  if (!datas.length) return [];
+  const ordemBase =
+    categoria === CATEGORIA_PLANTAO.TECNICO ? params.ordemTecInicial : params.ordemVetInicial;
+  const ordem = normalizarOrdemRodizioCompleta(ordemBase, ordemBase);
+  if (!ordem.length) return [];
+  const plantoesRef = params.plantoes.filter((p) => categoriaPlantaoDe(p) === categoria);
+  if (categoria === CATEGORIA_PLANTAO.TECNICO) {
+    return simularRodizioTecPlantoes(
+      ordem,
+      datas,
+      afastamentosSubset,
+      params.datasNaoUteisIsoSet,
+      0,
+      plantoesRef,
+    ).alocacoes;
+  }
+  return simularRodizioVetPlantoes(ordem, datas, afastamentosSubset, params.datasNaoUteisIsoSet).alocacoes;
+}
+
+function mapasRodizioComESemAfastamento(af, params) {
+  const idAf = Number(af.id);
+  const cat = categoriaAfastamentoUsuarioFiltro(params, af.usuarioId);
+  const outros = params.afastamentosLista.filter((a) => Number(a.id) !== idAf);
+  const com = simularAlocacoesRodizioCategoria(params, cat, [...outros, af]);
+  const sem = simularAlocacoesRodizioCategoria(params, cat, outros);
+  return { com: mapaAlocacoesRodizio(com), sem: mapaAlocacoesRodizio(sem), cat };
+}
+
+function mapaPlantoesGravadosCategoria(params, categoria) {
+  const mapa = new Map();
+  for (const p of params.plantoes || []) {
+    if (categoriaPlantaoDe(p) !== categoria) continue;
+    const ds = p.dataReferencia;
+    if (!ds) continue;
+    const k =
+      p.vagaIndice != null && p.vagaIndice !== undefined
+        ? `${ds}|${Number(p.vagaIndice)}`
+        : ds;
+    mapa.set(k, Number(p.usuarioId));
+  }
+  return mapa;
+}
+
+function contextoRecalculoFocadoParaAfastamento(af, params) {
+  const uid = Number(af.usuarioId);
+  const cat = categoriaAfastamentoUsuarioFiltro(params, af.usuarioId);
+  const ordem =
+    cat === CATEGORIA_PLANTAO.TECNICO ? params.ordemTecInicial : params.ordemVetInicial;
+  const outros = params.afastamentosLista.filter((a) => Number(a.id) !== Number(af.id));
+  const todos = [...outros, af];
+  const afastamentosPorUsuario = montarAfastamentosPorUsuario(todos);
+  const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
+    todos,
+    params.plantoes || [],
+    params.datasNaoUteisIsoSet,
+    params.categoriaPorUsuarioId,
+  );
+  const datasPlantoesOrdenadas = [
+    ...new Set(
+      (params.plantoes || [])
+        .filter((p) => categoriaPlantaoDe(p) === cat)
+        .map((p) => p.dataReferencia)
+        .filter(Boolean),
+    ),
+  ].sort();
+  return {
+    uid,
+    cat,
+    ordem,
+    outros,
+    afastamentosPorUsuario,
+    retornosFeriasNoPrimeiroPlantao,
+    datasPlantoesOrdenadas,
+  };
+}
+
+/** O titular já está escalado em algum plantão dentro do intervalo do afastamento. */
+function afastamentoFeriasOuAbonoTemPlantaoTitularNoPeriodo(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return false;
+  const uid = Number(af.usuarioId);
+  const inicioIso = dataReferenciaParaStr(af.dataInicio);
+  const fimIso = dataReferenciaParaStr(af.dataFim);
+  if (!Number.isFinite(uid) || uid < 1 || !inicioIso || !fimIso) return false;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, uid);
+  return (params.plantoes || []).some((p) => {
+    if (categoriaPlantaoDe(p) !== cat) return false;
+    if (Number(p.usuarioId) !== uid) return false;
+    const ds = p.dataReferencia || dataReferenciaParaStr(p.dataReferencia);
+    return ds && ds >= inicioIso && ds <= fimIso;
+  });
+}
+
+/** Calendário gravado já reflete a simulação com todos os afastamentos da lista (incluindo este). */
+function afastamentoFeriasOuAbonoRedundanteNoCalendario(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return false;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, af.usuarioId);
+  const gravados = mapaPlantoesGravadosCategoria(params, cat);
+  const temGravadosNaCategoria = [...gravados.values()].some((uid) => Number.isFinite(uid) && uid > 0);
+  if (!temGravadosNaCategoria) return false;
+  const todos = (params.afastamentosLista || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+  const comTodos = mapaAlocacoesRodizio(simularAlocacoesRodizioCategoria(params, cat, todos));
+  for (const [k, uidGrav] of gravados) {
+    if (Number(comTodos.get(k)) !== Number(uidGrav)) return false;
+  }
+  return true;
+}
+
+/**
+ * Férias/abono relevantes quando incluir o afastamento altera o rodízio em relação ao calendário
+ * gravado (ou, sem calendário, em relação à simulação sem ele).
+ */
+function afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
+  if (afastamentoFeriasOuAbonoRedundanteNoCalendario(af, params)) return false;
+  const { com, sem, cat } = mapasRodizioComESemAfastamento(af, params);
+  const gravados = mapaPlantoesGravadosCategoria(params, cat);
+  const temGravadosNaCategoria = [...gravados.values()].some((uid) => Number.isFinite(uid) && uid > 0);
+  if (temGravadosNaCategoria) {
+    for (const [k, uidGrav] of gravados) {
+      if (Number(com.get(k)) !== Number(uidGrav)) return true;
+    }
+    return false;
+  }
+  for (const [k, vCom] of com) {
+    if (sem.get(k) !== vCom) return true;
+  }
+  return false;
+}
+
+/** Altera plantão do titular (simulação com afastamento ≠ calendário/sem nas datas dele). */
+function afastamentoFeriasOuAbonoAlteraPlantoesDoUsuario(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
+  if (afastamentoFeriasOuAbonoRedundanteNoCalendario(af, params)) return false;
+  if (!afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params)) return false;
+  const uid = Number(af.usuarioId);
+  const { com, sem, cat } = mapasRodizioComESemAfastamento(af, params);
+  const gravados = mapaPlantoesGravadosCategoria(params, cat);
+  const temGravadosNaCategoria = [...gravados.values()].some((uid) => Number.isFinite(uid) && uid > 0);
+
+  if (temGravadosNaCategoria) {
+    if (!afastamentoFeriasOuAbonoTemPlantaoTitularNoPeriodo(af, params)) {
+      return false;
+    }
+    for (const [k, uidGravado] of gravados) {
+      if (Number(uidGravado) !== uid) continue;
+      if (Number(com.get(k)) !== Number(uidGravado)) return true;
+    }
+    return false;
+  }
+
+  for (const [k, vSem] of sem) {
+    if (Number(vSem) === uid && Number(com.get(k)) !== Number(vSem)) return true;
+  }
+  return false;
+}
+
+function abonoMudaAlgumPlantaoDoRodizio(af, params) {
+  return afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params);
+}
+
+function afastamentoFeriasOuAbonoEntraNoRodizio(af, params) {
+  return afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params);
+}
+
+/** Mantém só férias/abono que mudam plantões (exclui “sem efeito” do rodízio). */
+function filtrarAfastamentosFeriasAbonoSemEfeitoEmPlantoes(afs, params) {
+  return (afs || [])
+    .map((a) => (a.get ? a.get({ plain: true }) : a))
+    .filter((af) => {
+      if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return false;
+      return afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params);
+    });
+}
+
+function afastamentosEfetivosRodizioEscala(afs, params) {
+  return filtrarAfastamentosFeriasAbonoSemEfeitoEmPlantoes(afs, params);
+}
+
+function afastamentosParaSimulacaoPlenaCategoria(brutos, efetivos, params, categoria) {
+  const idsEfetivos = new Set((efetivos || []).map((a) => Number(a.id)));
+  const cat = String(categoria || '').toLowerCase();
+  return (brutos || [])
+    .map((a) => (a.get ? a.get({ plain: true }) : a))
+    .filter((a) => {
+      if (categoriaAfastamentoUsuarioFiltro(params, a.usuarioId) !== cat) return false;
+      if (!afastamentoEhFerias(a) && !afastamentoEhAbono(a)) return true;
+      return idsEfetivos.has(Number(a.id));
+    });
+}
+
+function afastamentosListaParaRodizioEscala(afastamentos, paramsFiltro) {
+  return (afastamentos || []).filter((row) => {
+    const plain = row.get ? row.get({ plain: true }) : row;
+    if (!afastamentoEhFerias(plain) && !afastamentoEhAbono(plain)) return true;
+    return !afastamentoFeriasOuAbonoRedundanteNoCalendario(plain, paramsFiltro);
+  });
+}
+
+/**
  * Simula o rodízio de veterinários (sem modo focalizado) — usado em testes e depuração.
  */
 function simularRodizioVetPlantoes(ordemInicial, datasPlantaoIso, afastamentosFlat, datasNaoUteisIsoSet = new Set()) {
@@ -4019,7 +4285,6 @@ async function recalcularEscalaInterno(
     ],
     transaction,
   });
-  const afastamentosPorUsuario = montarAfastamentosPorUsuario(afastamentos);
   /**
    * Em escalas de fim de semana, plantões adicionais em dias úteis representam feriado/ponto facultativo
    * e não devem contar como "dia útil trabalhado" para liberar retorno pós-férias/abono.
@@ -4039,8 +4304,55 @@ async function recalcularEscalaInterno(
   for (const id of ordemAtualTec) {
     categoriaPorUsuarioIdRetorno.set(Number(id), CATEGORIA_PLANTAO.TECNICO);
   }
+
+  const ordemVetParaFiltroAfastamento =
+    ordemCicloRefVet.length > 0
+      ? [...ordemCicloRefVet]
+      : aplicouOrdemInicialVet
+        ? [...ordemAtualVet]
+        : [...ordemAtualDbInicialVet];
+  const ordemTecParaFiltroAfastamento =
+    ordemCicloRefTec.length > 0
+      ? [...ordemCicloRefTec]
+      : aplicouOrdemInicialTec
+        ? [...ordemAtualTec]
+        : [...ordemAtualDbInicialTec];
+  const paramsFiltroAfastamento = montarParametrosFiltroAfastamentoPlantoes({
+    plantoes,
+    ordemVetInicial: ordemVetParaFiltroAfastamento,
+    ordemTecInicial: ordemTecParaFiltroAfastamento,
+    afastamentosLista: (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a)),
+    periodicidadeEscala: escala.periodicidade,
+    categoriaPorUsuarioId: categoriaPorUsuarioIdRetorno,
+  });
+  const afastamentosRodizio = afastamentosListaParaRodizioEscala(afastamentos, paramsFiltroAfastamento);
+  const afastamentosPlainRodizio = afastamentosRodizio.map((a) => (a.get ? a.get({ plain: true }) : a));
+
+  if (historicoMotivo === 'afastamento' && historicoAfastamento) {
+    const afFocadoIrrelevante = historicoAfastamento.get
+      ? historicoAfastamento.get({ plain: true })
+      : historicoAfastamento;
+    if (
+      (afastamentoEhFerias(afFocadoIrrelevante) || afastamentoEhAbono(afFocadoIrrelevante)) &&
+      afastamentoFeriasOuAbonoRedundanteNoCalendario(afFocadoIrrelevante, paramsFiltroAfastamento)
+    ) {
+      return {
+        atualizados: 0,
+        ordemMudou: false,
+        ordemUsuarioIds: [...ordemAtualVet, ...ordemAtualTec],
+        ordemAtualVet,
+        ordemAtualTec,
+        ordemInicialVet: ordemAtualDbInicialVet,
+        ordemInicialTec: ordemAtualDbInicialTec,
+        ordemGlobalMudou: false,
+      };
+    }
+  }
+
+  const afastamentosPorUsuario = montarAfastamentosPorUsuario(afastamentosRodizio);
+
   const retornosFeriasNoPrimeiroPlantao = montarRetornosFeriasNoPrimeiroPlantao(
-    afastamentos,
+    afastamentosRodizio,
     plantoes,
     datasNaoUteisParaRetornoPosAfastamento,
     categoriaPorUsuarioIdRetorno,
@@ -4121,7 +4433,7 @@ async function recalcularEscalaInterno(
 
   const outrosAfastamentosFocado =
     modoRecalculoFocado && historicoAfastamento
-      ? afastamentos
+      ? afastamentosRodizio
           .filter((a) => Number(a.id) !== Number(historicoAfastamento.id))
           .map((a) => (a.get ? a.get({ plain: true }) : a))
       : [];
@@ -4799,7 +5111,6 @@ async function recalcularEscalaInterno(
     afFocadoPlain && ordemAtualDbInicialTec.includes(Number(afFocadoPlain.usuarioId));
 
   if (rodizioContinuoEscala && modoRecalculoFocado) {
-    const afListPleno = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
     const ordemVetPleno =
       ordemCicloRefVet.length > 0 ? ordemCicloRefVet : ordemAtualDbInicialVet;
     const ordemTecPleno =
@@ -4808,7 +5119,7 @@ async function recalcularEscalaInterno(
       plantoes,
       ordemVetInicial: ordemVetPleno,
       ordemTecInicial: ordemTecPleno,
-      afastamentosFlat: afListPleno,
+      afastamentosFlat: afastamentosPlainRodizio,
       datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
     });
     if (resPlenoBimestre.atualizados > 0) {
@@ -4829,7 +5140,7 @@ async function recalcularEscalaInterno(
     outrosAfastamentosFocado.length > 0 &&
     focalEhTec
   ) {
-    const afListAlinhar = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+    const afListAlinhar = afastamentosPlainRodizio;
     const ordemAlinharPleno =
       ordemCicloRefTec.length > 0
         ? ordemCicloRefTec
@@ -4903,7 +5214,7 @@ async function recalcularEscalaInterno(
     outrosAfastamentosFocado.length > 0 &&
     focalEhVet
   ) {
-    const afListAlinharVet = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+    const afListAlinharVet = afastamentosPlainRodizio;
     const ordemAlinharVet =
       ordemCicloRefVet.length > 0
         ? ordemCicloRefVet
@@ -5023,7 +5334,6 @@ async function recalcularEscalaInterno(
     (afastamentoEhAbono(afFocadoPlain) || afastamentoEhFerias(afFocadoPlain)) &&
     ordemAtualDbInicialVet.includes(Number(afFocadoPlain.usuarioId));
   if (abonoFocadoReconstruirOrdemTec) {
-    const afList = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
     const ordemRefTec =
       ordemCicloRefTec.length > 0
         ? ordemCicloRefTec
@@ -5035,7 +5345,7 @@ async function recalcularEscalaInterno(
       const rebTecBimestre = derivarOrdemTecRodizioConsistenteComPlantoes({
         plantoes,
         ordemBase: ordemBaseTec,
-        afastamentosLista: afList,
+        afastamentosLista: afastamentosPlainRodizio,
         datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
       });
       if (rebTecBimestre.ordemAtual.length > 0) {
@@ -5049,7 +5359,7 @@ async function recalcularEscalaInterno(
       const reb = derivarOrdemTecRodizioConsistenteComPlantoes({
         plantoes,
         ordemBase: ordemBaseTec,
-        afastamentosLista: afList,
+        afastamentosLista: afastamentosPlainRodizio,
         datasNaoUteisIsoSet: datasNaoUteisParaRetornoPosAfastamento,
       });
       if (reb.ordemAtual.length > 0) {
@@ -5060,7 +5370,7 @@ async function recalcularEscalaInterno(
     }
   }
   if (afastamentoFocadoReconstruirOrdemVet) {
-    const afList = (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a));
+    const afList = afastamentosPlainRodizio;
     const ordemRefVet =
       ordemCicloRefVet.length > 0
         ? ordemCicloRefVet
@@ -6986,6 +7296,17 @@ EscalaService.__testables = {
   obterIdsAfastamentosMaisRecentesPorClasse,
   afastamentoEhMaisRecenteDaClasse,
   restaurarEstadoAntesAfastamento,
+  montarParametrosFiltroAfastamentoPlantoes,
+  afastamentoFeriasOuAbonoAlteraPlantoesDoUsuario,
+  afastamentoFeriasOuAbonoTemPlantaoTitularNoPeriodo,
+  afastamentoFeriasOuAbonoRedundanteNoCalendario,
+  afastamentoFeriasOuAbonoRelevanteNoRodizio,
+  filtrarAfastamentosFeriasAbonoSemEfeitoEmPlantoes,
+  afastamentosEfetivosRodizioEscala,
+  afastamentosParaSimulacaoPlenaCategoria,
+  afastamentoFeriasOuAbonoEntraNoRodizio,
+  abonoMudaAlgumPlantaoDoRodizio,
+  afastamentosListaParaRodizioEscala,
 };
 
 module.exports = EscalaService;
