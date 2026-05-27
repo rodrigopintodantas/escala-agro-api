@@ -40,13 +40,17 @@ const AfastamentoService = {
     const idsDesfazer = new Set(
       [idVet, idTec].filter((x) => Number.isFinite(Number(x)) && Number(x) > 0).map(Number),
     );
-    return rows.map((r) => {
+    const lista = rows.map((r) => {
       const plain = r.get({ plain: true });
       return {
         ...plain,
         desfazerDisponivel: idsDesfazer.has(Number(plain.id)),
       };
     });
+    if (admin) {
+      return EscalaService.enriquecerRelevanciaEscalaAtivaAfastamentos(lista);
+    }
+    return lista;
   },
 
   criar: async (usuarioIdLogado, body) => {

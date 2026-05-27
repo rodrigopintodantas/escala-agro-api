@@ -1199,6 +1199,13 @@ function plantaoRequerRecalculoFocadoTec(
   if (!Number.isFinite(uid) || uid < 1 || !ordemAtual?.length) return false;
   if (categoriaPlantaoDe(plantao) !== CATEGORIA_PLANTAO.TECNICO) return false;
   /**
+   * Isolamento entre categorias: se o titular do afastamento focado não pertence à categoria
+   * do plantão (ex.: técnico focado em plantão vet), esse plantão não está sujeito ao recálculo.
+   * Sem essa guarda, o mapa compartilhado `retornosFeriasNoPrimeiroPlantao` (vet+téc) faz a
+   * função retornar true quando o usuário focado está nos retornos do dia da outra categoria.
+   */
+  if (!ordemAtual.includes(uid)) return false;
+  /**
    * Abono focalizado: após o fim, re-simula só quando necessário.
    * - 2º abono (ex.: Diego): onda entre fim e 1º retorno (como vet), sem reabrir domingo 21.
    * - 3º+ abono (ex.: Fábio): titular + dia de retorno do par; retroativo tira titular do sáb/dom.
@@ -1326,6 +1333,12 @@ function plantaoRequerRecalculoFocadoVet(
   const uid = Number(usuarioAfetadoId);
   if (!Number.isFinite(uid) || uid < 1 || !ordemAtual?.length) return false;
   if (categoriaPlantaoDe(plantao) !== CATEGORIA_PLANTAO.VETERINARIO) return false;
+  /**
+   * Isolamento entre categorias: titular do afastamento focado fora da ordem vet (ex.: técnico)
+   * não deve marcar plantões vet como "exige recálculo". O mapa de retornos é compartilhado
+   * vet+téc, então é necessário descartar explicitamente esses casos antes das verificações.
+   */
+  if (!ordemAtual.includes(uid)) return false;
 
   if (historicoAfastamento) {
     const af = historicoAfastamento.get ? historicoAfastamento.get({ plain: true }) : historicoAfastamento;
@@ -2296,11 +2309,15 @@ function categoriaAfastamentoUsuarioFiltro(params, usuarioId) {
   return CATEGORIA_PLANTAO.VETERINARIO;
 }
 
+/**
+ * Chave de alocação: sempre `dataIso|vagaIndice` (vaga ausente vira 0).
+ * Vet em produção grava `vaga_indice = 0` no banco — manter a mesma normalização aqui evita
+ * `sem.get(...)` retornar `undefined` por divergência de chave e classificar afastamento como
+ * "relevante" sem motivo.
+ */
 function chaveAlocacaoRodizio(aloc) {
-  if (aloc.vagaIndice != null && aloc.vagaIndice !== undefined) {
-    return `${aloc.dataIso}|${Number(aloc.vagaIndice)}`;
-  }
-  return String(aloc.dataIso);
+  const vaga = aloc.vagaIndice != null ? Number(aloc.vagaIndice) : 0;
+  return `${aloc.dataIso}|${vaga}`;
 }
 
 function mapaAlocacoesRodizio(alocacoes) {
@@ -2339,11 +2356,26 @@ function simularAlocacoesRodizioCategoria(params, categoria, afastamentosSubset)
   return simularRodizioVetPlantoes(ordem, datas, afastamentosSubset, params.datasNaoUteisIsoSet).alocacoes;
 }
 
+function afastamentosListaSemRegistro(af, lista) {
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const idAf = Number(plainAf?.id);
+  return (lista || []).filter((a) => {
+    const plain = a && a.get ? a.get({ plain: true }) : a;
+    if (Number.isFinite(idAf) && idAf > 0) return Number(plain.id) !== idAf;
+    return !(
+      Number(plain.usuarioId) === Number(plainAf.usuarioId) &&
+      dataReferenciaParaStr(plain.dataInicio) === dataReferenciaParaStr(plainAf.dataInicio) &&
+      dataReferenciaParaStr(plain.dataFim) === dataReferenciaParaStr(plainAf.dataFim) &&
+      Number(plain.tipoId) === Number(plainAf.tipoId)
+    );
+  });
+}
+
 function mapasRodizioComESemAfastamento(af, params) {
-  const idAf = Number(af.id);
-  const cat = categoriaAfastamentoUsuarioFiltro(params, af.usuarioId);
-  const outros = params.afastamentosLista.filter((a) => Number(a.id) !== idAf);
-  const com = simularAlocacoesRodizioCategoria(params, cat, [...outros, af]);
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, plainAf.usuarioId);
+  const outros = afastamentosListaSemRegistro(plainAf, params.afastamentosLista);
+  const com = simularAlocacoesRodizioCategoria(params, cat, [...outros, plainAf]);
   const sem = simularAlocacoesRodizioCategoria(params, cat, outros);
   return { com: mapaAlocacoesRodizio(com), sem: mapaAlocacoesRodizio(sem), cat };
 }
@@ -2354,11 +2386,8 @@ function mapaPlantoesGravadosCategoria(params, categoria) {
     if (categoriaPlantaoDe(p) !== categoria) continue;
     const ds = p.dataReferencia;
     if (!ds) continue;
-    const k =
-      p.vagaIndice != null && p.vagaIndice !== undefined
-        ? `${ds}|${Number(p.vagaIndice)}`
-        : ds;
-    mapa.set(k, Number(p.usuarioId));
+    const vaga = p.vagaIndice != null ? Number(p.vagaIndice) : 0;
+    mapa.set(`${ds}|${vaga}`, Number(p.usuarioId));
   }
   return mapa;
 }
@@ -2434,6 +2463,12 @@ function afastamentoFeriasOuAbonoRedundanteNoCalendario(af, params) {
 function afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params) {
   if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
   if (afastamentoFeriasOuAbonoRedundanteNoCalendario(af, params)) return false;
+  /**
+   * Abono/férias só "entra" no rodízio se tira o titular de pelo menos um plantão (ativo, retro-cadastro
+   * ou pós-fim sem dia útil). Caso contrário, o "retorno forçado" pós-afastamento moveria outro servidor
+   * sem motivo (ex.: abono Ana 15/07 em escala BCEFDHAG, Ana só escalada 25/07).
+   */
+  if (!afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(af, params)) return false;
   const { com, sem, cat } = mapasRodizioComESemAfastamento(af, params);
   const gravados = mapaPlantoesGravadosCategoria(params, cat);
   const temGravadosNaCategoria = [...gravados.values()].some((uid) => Number.isFinite(uid) && uid > 0);
@@ -2449,31 +2484,15 @@ function afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params) {
   return false;
 }
 
-/** Altera plantão do titular (simulação com afastamento ≠ calendário/sem nas datas dele). */
+/**
+ * Altera plantão do titular: afastamento efetivamente remove o titular de pelo menos um plantão
+ * em que ele estaria escalado (ativo, retro-cadastro ou pós-fim sem dia útil). Vale tanto para o
+ * calendário gravado quanto para a simulação "sem este afastamento" — robusto após recálculo.
+ */
 function afastamentoFeriasOuAbonoAlteraPlantoesDoUsuario(af, params) {
   if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
   if (afastamentoFeriasOuAbonoRedundanteNoCalendario(af, params)) return false;
-  if (!afastamentoFeriasOuAbonoRelevanteNoRodizio(af, params)) return false;
-  const uid = Number(af.usuarioId);
-  const { com, sem, cat } = mapasRodizioComESemAfastamento(af, params);
-  const gravados = mapaPlantoesGravadosCategoria(params, cat);
-  const temGravadosNaCategoria = [...gravados.values()].some((uid) => Number.isFinite(uid) && uid > 0);
-
-  if (temGravadosNaCategoria) {
-    if (!afastamentoFeriasOuAbonoTemPlantaoTitularNoPeriodo(af, params)) {
-      return false;
-    }
-    for (const [k, uidGravado] of gravados) {
-      if (Number(uidGravado) !== uid) continue;
-      if (Number(com.get(k)) !== Number(uidGravado)) return true;
-    }
-    return false;
-  }
-
-  for (const [k, vSem] of sem) {
-    if (Number(vSem) === uid && Number(com.get(k)) !== Number(vSem)) return true;
-  }
-  return false;
+  return afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(af, params);
 }
 
 function abonoMudaAlgumPlantaoDoRodizio(af, params) {
@@ -2510,12 +2529,392 @@ function afastamentosParaSimulacaoPlenaCategoria(brutos, efetivos, params, categ
     });
 }
 
+/**
+ * Férias/abono efetivamente tira o titular de algum plantão (ativo no dia, retro-cadastro pré-início,
+ * ou pós-fim sem dia útil intermediário). Considera o titular tanto no calendário já gravado quanto na
+ * simulação "sem este afastamento" — cobre o recálculo após a escala já estar ajustada.
+ */
+function afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return false;
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const uid = Number(plainAf.usuarioId);
+  if (!Number.isFinite(uid) || uid < 1) return false;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, uid);
+  const datasNaoUteisIsoSet = params.datasNaoUteisIsoSet || new Set();
+  const apenasEsse = montarAfastamentosPorUsuario([plainAf]);
+
+  for (const p of params.plantoes || []) {
+    if (categoriaPlantaoDe(p) !== cat) continue;
+    if (Number(p.usuarioId) !== uid) continue;
+    const dataIso = p.dataReferencia || dataReferenciaParaStr(p.dataReferencia);
+    if (!dataIso) continue;
+    if (usuarioIndisponivelParaPlantaoNoDia(apenasEsse, uid, dataIso, datasNaoUteisIsoSet)) return true;
+  }
+
+  const { sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  for (const [k, uidAlocado] of sem) {
+    if (Number(uidAlocado) !== uid) continue;
+    const dataIso = String(k).includes('|') ? String(k).split('|')[0] : String(k);
+    if (usuarioIndisponivelParaPlantaoNoDia(apenasEsse, uid, dataIso, datasNaoUteisIsoSet)) return true;
+  }
+  return false;
+}
+
 function afastamentosListaParaRodizioEscala(afastamentos, paramsFiltro) {
   return (afastamentos || []).filter((row) => {
     const plain = row.get ? row.get({ plain: true }) : row;
     if (!afastamentoEhFerias(plain) && !afastamentoEhAbono(plain)) return true;
-    return !afastamentoFeriasOuAbonoRedundanteNoCalendario(plain, paramsFiltro);
+    /**
+     * Filtro do rodízio: removemos apenas o afastamento sem efeito real (titular não perde plantão).
+     * Não usar `Redundante` aqui — afastamentos já refletidos no calendário gravado ainda precisam
+     * entrar na re-simulação plena (sincronizarCalendarioRodizioPlenoEscalaBimestre) para reproduzir
+     * o mesmo calendário; caso contrário a simulação roda sem eles e sobrescreve com a ordem alfabética.
+     */
+    return afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(plain, paramsFiltro);
   });
+}
+
+/** Escalas em `ativa` ou `rascunho` (prioridade: ativa, depois a mais recente). */
+async function obterEscalasAbertasRelevancia(transaction = null) {
+  return EscalaModel.findAll({
+    where: { status: { [Op.in]: ['ativa', 'rascunho'] } },
+    attributes: ['id', 'nome', 'dataInicio', 'dataFim', 'periodicidade', 'status'],
+    order: [
+      [sequelize.literal("CASE WHEN status = 'ativa' THEN 0 WHEN status = 'rascunho' THEN 1 ELSE 2 END"), 'ASC'],
+      ['dataInicio', 'DESC'],
+      ['id', 'DESC'],
+    ],
+    transaction,
+  });
+}
+
+/** Contexto de uma escala aberta para classificar relevância de afastamentos na listagem admin. */
+async function montarContextoRelevanciaEscala(escala, transaction = null) {
+  const escalaId = Number(escala.id);
+  const dataInicioStr = dataReferenciaParaStr(escala.dataInicio);
+  const dataFimStr = dataReferenciaParaStr(escala.dataFim);
+
+  const membros = await obterMembrosAtivosEscala(escalaId, transaction);
+  const ordemAtualDbInicialVet = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  const ordemAtualDbInicialTec = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+
+  const ordemCicloRefVet = await obterOrdemCicloReferenciaEscala(
+    escalaId,
+    ordemAtualDbInicialVet,
+    CATEGORIA_MEMBRO.VETERINARIO,
+    transaction,
+  );
+  const ordemCicloRefTec = await obterOrdemCicloReferenciaEscala(
+    escalaId,
+    ordemAtualDbInicialTec,
+    CATEGORIA_MEMBRO.TECNICO,
+    transaction,
+  );
+
+  let ordemAtualVet = [...ordemAtualDbInicialVet];
+  let ordemAtualTec = [...ordemAtualDbInicialTec];
+  const porFimDesc = await AfastamentoModel.findAll({
+    where: {
+      usuarioId: { [Op.in]: [...new Set([...ordemAtualDbInicialVet, ...ordemAtualDbInicialTec])] },
+      dataInicio: { [Op.lte]: dataFimStr },
+      dataFim: { [Op.gte]: dataInicioStr },
+    },
+    include: [{ model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'regraOrdem'] }],
+    order: [
+      ['dataFim', 'DESC'],
+      ['dataInicio', 'DESC'],
+      ['id', 'DESC'],
+    ],
+    transaction,
+  });
+  for (const outro of porFimDesc) {
+    const catOutro =
+      (await escopoOrdemGlobalParaUsuarioId(outro.usuarioId, transaction)) === ESCOPO_ORDEM.TECNICO
+        ? CATEGORIA_MEMBRO.TECNICO
+        : CATEGORIA_MEMBRO.VETERINARIO;
+    const histOutro = await buscarHistoricoOrdemParaAfastamento(escalaId, outro.id, catOutro, transaction);
+    if (!histOutro) continue;
+    const plainOutro = histOutro.get ? histOutro.get({ plain: true }) : histOutro;
+    const idsDepois = Array.isArray(plainOutro.ordemUsuarioIds)
+      ? plainOutro.ordemUsuarioIds.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+      : [];
+    if (idsDepois.length === 0) continue;
+    if (catOutro === CATEGORIA_MEMBRO.TECNICO) ordemAtualTec = idsDepois;
+    else ordemAtualVet = idsDepois;
+    break;
+  }
+
+  const ordemVetParaFiltro = ordemCicloRefVet.length > 0 ? [...ordemCicloRefVet] : [...ordemAtualDbInicialVet];
+  const ordemTecParaFiltro = ordemCicloRefTec.length > 0 ? [...ordemCicloRefTec] : [...ordemAtualDbInicialTec];
+
+  const plantoes = await PlantaoModel.findAll({
+    where: { escalaId },
+    order: [
+      ['dataReferencia', 'ASC'],
+      [sequelize.literal("CASE WHEN categoria_plantao = 'veterinario' THEN 0 ELSE 1 END"), 'ASC'],
+      ['vagaIndice', 'ASC'],
+      ['id', 'ASC'],
+    ],
+    transaction,
+  });
+
+  const idsParaAfastamentos = [
+    ...new Set([
+      ...ordemAtualVet,
+      ...ordemAtualTec,
+      ...ordemAtualDbInicialVet,
+      ...ordemAtualDbInicialTec,
+      ...ordemVetParaFiltro,
+      ...ordemTecParaFiltro,
+    ]),
+  ].filter((id) => Number.isFinite(id) && id > 0);
+
+  const afastamentos =
+    idsParaAfastamentos.length > 0
+      ? await AfastamentoModel.findAll({
+          where: {
+            usuarioId: { [Op.in]: idsParaAfastamentos },
+            dataInicio: { [Op.lte]: dataFimStr },
+            dataFim: { [Op.gte]: dataInicioStr },
+          },
+          include: [{ model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] }],
+          transaction,
+        })
+      : [];
+
+  const categoriaPorUsuarioId = new Map();
+  for (const id of ordemAtualVet) {
+    categoriaPorUsuarioId.set(Number(id), CATEGORIA_PLANTAO.VETERINARIO);
+  }
+  for (const id of ordemAtualTec) {
+    categoriaPorUsuarioId.set(Number(id), CATEGORIA_PLANTAO.TECNICO);
+  }
+
+  const plantoesPlain = (plantoes || []).map((p) => {
+    const row = p.get ? p.get({ plain: true }) : p;
+    return {
+      ...row,
+      dataReferencia: dataReferenciaParaStr(row.dataReferencia),
+      categoriaPlantao: categoriaPlantaoDe(row),
+      usuarioId: row.usuarioId != null ? Number(row.usuarioId) : undefined,
+    };
+  });
+
+  const paramsFiltro = montarParametrosFiltroAfastamentoPlantoes({
+    plantoes: plantoesPlain,
+    ordemVetInicial: ordemVetParaFiltro,
+    ordemTecInicial: ordemTecParaFiltro,
+    afastamentosLista: (afastamentos || []).map((a) => (a.get ? a.get({ plain: true }) : a)),
+    periodicidadeEscala: escala.periodicidade,
+    categoriaPorUsuarioId,
+  });
+
+  return {
+    escalaId,
+    escalaNome: escala.nome || null,
+    escalaStatus: String(escala.status || '').toLowerCase(),
+    dataInicioStr,
+    dataFimStr,
+    paramsFiltro,
+  };
+}
+
+/** Compat.: contexto da primeira escala aberta (ativa preferida). */
+async function obterContextoRelevanciaEscalaAtiva(transaction = null) {
+  const escalas = await obterEscalasAbertasRelevancia(transaction);
+  if (!escalas.length) return null;
+  return montarContextoRelevanciaEscala(escalas[0], transaction);
+}
+
+async function resolverContextoRelevanciaAfastamento(afPlain, cache, transaction = null) {
+  const escalas = cache?.escalasAbertas || (await obterEscalasAbertasRelevancia(transaction));
+  if (!escalas.length) return null;
+
+  const ini = dataReferenciaParaStr(afPlain.dataInicio);
+  const fim = dataReferenciaParaStr(afPlain.dataFim);
+
+  let escalaEscolhida = escalas[0];
+  for (const escala of escalas) {
+    const dataInicioStr = dataReferenciaParaStr(escala.dataInicio);
+    const dataFimStr = dataReferenciaParaStr(escala.dataFim);
+    if (fim >= dataInicioStr && ini <= dataFimStr) {
+      escalaEscolhida = escala;
+      break;
+    }
+  }
+
+  const escalaId = Number(escalaEscolhida.id);
+  if (!cache.ctxByEscalaId) cache.ctxByEscalaId = new Map();
+  if (!cache.ctxByEscalaId.has(escalaId)) {
+    cache.ctxByEscalaId.set(escalaId, await montarContextoRelevanciaEscala(escalaEscolhida, transaction));
+  }
+  return cache.ctxByEscalaId.get(escalaId);
+}
+
+/** Titular teria plantão no intervalo do afastamento na simulação sem este registro. */
+function afastamentoFeriasOuAbonoTitularEscaladoNoPeriodoSemAfastamento(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
+  const uid = Number(af.usuarioId);
+  const inicioIso = dataReferenciaParaStr(af.dataInicio);
+  const fimIso = dataReferenciaParaStr(af.dataFim);
+  if (!Number.isFinite(uid) || uid < 1 || !inicioIso || !fimIso) return false;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, af.usuarioId);
+  const { sem } = mapasRodizioComESemAfastamento(af, params);
+  for (const p of params.plantoes || []) {
+    if (categoriaPlantaoDe(p) !== cat) continue;
+    const ds = p.dataReferencia || dataReferenciaParaStr(p.dataReferencia);
+    if (!ds || ds < inicioIso || ds > fimIso) continue;
+    const vaga = p.vagaIndice != null ? Number(p.vagaIndice) : 0;
+    if (Number(sem.get(`${ds}|${vaga}`)) === uid) return true;
+  }
+  return false;
+}
+
+/**
+ * O calendário gravado difere da simulação sem este afastamento (mantendo os demais).
+ * Serve só para exibição na listagem admin — não altera o recálculo.
+ */
+function afastamentoFeriasOuAbonoContribuiParaCalendarioGravado(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, af.usuarioId);
+  const gravados = mapaPlantoesGravadosCategoria(params, cat);
+  const temGravadosNaCategoria = [...gravados.values()].some((uid) => Number.isFinite(uid) && uid > 0);
+  const { com, sem } = mapasRodizioComESemAfastamento(af, params);
+  if (!temGravadosNaCategoria) {
+    for (const [k, vSem] of sem) {
+      if (Number(com.get(k)) !== Number(vSem)) return true;
+    }
+    return false;
+  }
+  for (const [k, uidGrav] of gravados) {
+    if (Number(sem.get(k)) !== Number(uidGrav)) return true;
+  }
+  return false;
+}
+
+/**
+ * Janela para tag: início retroativo até o fim da escala (não só dataFim do cadastro).
+ * Abono em 12/06 pode alterar plantão em 13/06; limitar ao fim do cadastro omitia esse efeito.
+ */
+function periodoRetroAfastamentoParaTag(af, params, escalaFimStr) {
+  let inicioIso = dataReferenciaParaStr(af.dataInicio);
+  const retroInicio = calcularDataInicioRetroCadastro(inicioIso, params.datasNaoUteisIsoSet || new Set());
+  if (retroInicio < inicioIso) inicioIso = retroInicio;
+  const fimCadastro = dataReferenciaParaStr(af.dataFim);
+  const fimLimiteEscala =
+    escalaFimStr && /^\d{4}-\d{2}-\d{2}$/.test(String(escalaFimStr)) ? String(escalaFimStr) : fimCadastro;
+  return { inicioIso, fimCadastro, fimLimiteEscala };
+}
+
+/** Com vs sem: titular envolvido em mudança de alocação no período retroativo. */
+function afastamentoFeriasOuAbonoRelevanteParaTagEscala(af, params, escalaFimStr) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const uid = Number(plainAf.usuarioId);
+  if (!Number.isFinite(uid) || uid < 1) return true;
+  const { inicioIso, fimCadastro } = periodoRetroAfastamentoParaTag(plainAf, params, escalaFimStr);
+  const cat = categoriaAfastamentoUsuarioFiltro(params, plainAf.usuarioId);
+  const { com, sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  const chaves = new Set([...com.keys(), ...sem.keys()]);
+  for (const k of chaves) {
+    const ds = String(k).includes('|') ? String(k).split('|')[0] : String(k);
+    if (ds < inicioIso || ds > fimCadastro) continue;
+    const vSem = Number(sem.get(k));
+    const vCom = Number(com.get(k));
+    if (!Number.isFinite(vSem) && !Number.isFinite(vCom)) continue;
+    if (vSem === vCom) continue;
+    if (vSem === uid || vCom === uid) return true;
+  }
+  return false;
+}
+
+/** Incluir este afastamento não muda o rodízio simulado (com === sem em todas as datas). */
+function afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem(af, params) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return false;
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const { com, sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  const chaves = new Set([...com.keys(), ...sem.keys()]);
+  for (const k of chaves) {
+    if (Number(com.get(k)) !== Number(sem.get(k))) return false;
+  }
+  return true;
+}
+
+/**
+ * Calendário gravado ≠ simulação sem este afastamento, em datas em que com≠sem (efeito deste cadastro).
+ */
+function afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(af, params, escalaFimStr) {
+  if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return true;
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const { inicioIso, fimLimiteEscala } = periodoRetroAfastamentoParaTag(plainAf, params, escalaFimStr);
+  const cat = categoriaAfastamentoUsuarioFiltro(params, plainAf.usuarioId);
+  const gravados = mapaPlantoesGravadosCategoria(params, cat);
+  const { com, sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  for (const [k, uidGrav] of gravados) {
+    const ds = String(k).includes('|') ? String(k).split('|')[0] : String(k);
+    if (ds < inicioIso || ds > fimLimiteEscala) continue;
+    if (Number(com.get(k)) === Number(sem.get(k))) continue;
+    if (Number(sem.get(k)) !== Number(uidGrav)) return true;
+  }
+  return false;
+}
+
+/**
+ * `relevante` | `irrelevante` | `fora_periodo` — só para tags na listagem admin.
+ */
+function classificarRelevanciaAfastamentoEscalaAtiva(afPlain, ctx) {
+  const ini = dataReferenciaParaStr(afPlain.dataInicio);
+  const fim = dataReferenciaParaStr(afPlain.dataFim);
+  if (fim < ctx.dataInicioStr || ini > ctx.dataFimStr) {
+    return 'fora_periodo';
+  }
+  if (!afastamentoEhFerias(afPlain) && !afastamentoEhAbono(afPlain)) {
+    return 'relevante';
+  }
+  const params = ctx.paramsFiltro;
+  if (afastamentoFeriasOuAbonoAlteraPlantoesDoUsuario(afPlain, params)) {
+    return 'relevante';
+  }
+  if (afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem(afPlain, params)) {
+    return 'irrelevante';
+  }
+  if (afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(afPlain, params, ctx.dataFimStr)) {
+    return 'relevante';
+  }
+  if (afastamentoFeriasOuAbonoRelevanteParaTagEscala(afPlain, params, ctx.dataFimStr)) {
+    return 'relevante';
+  }
+  return 'irrelevante';
+}
+
+async function enriquecerRelevanciaEscalaAtivaAfastamentos(lista) {
+  const cache = { escalasAbertas: await obterEscalasAbertasRelevancia(), ctxByEscalaId: new Map() };
+  if (!cache.escalasAbertas.length) {
+    return (lista || []).map((af) => ({
+      ...(af.get ? af.get({ plain: true }) : af),
+      relevanciaEscalaAtiva: null,
+      escalaAtivaNome: null,
+      escalaReferenciaStatus: null,
+    }));
+  }
+  const resultado = [];
+  for (const af of lista || []) {
+    const plain = af.get ? af.get({ plain: true }) : af;
+    const ctx = await resolverContextoRelevanciaAfastamento(plain, cache);
+    resultado.push({
+      ...plain,
+      relevanciaEscalaAtiva: classificarRelevanciaAfastamentoEscalaAtiva(plain, ctx),
+      escalaAtivaNome: ctx.escalaNome,
+      escalaReferenciaStatus: ctx.escalaStatus === 'rascunho' ? 'rascunho' : 'ativa',
+    });
+  }
+  return resultado;
 }
 
 /**
@@ -4768,6 +5167,12 @@ async function recalcularEscalaInterno(
         : null;
     const retornosRelevantesFocado = (retornosHojeFocado || []).filter((u) => {
       const uidR = Number(u);
+      /**
+       * Isolamento entre categorias: o mapa de retornos é compartilhado vet+téc; se o usuário
+       * do retorno não pertence à ordem da categoria do plantão atual, ignorar para não impedir
+       * o pulo do plantão (ex.: abono téc Álvaro 18/06 não pode bloquear o pulo em plantão vet).
+       */
+      if (!ordemAtual.includes(uidR)) return false;
       const uidFoc = Number(usuarioAfetadoRecalculoId);
       if (uidR === uidFoc) {
         if (primeiraRetornoFocApi && dataIso === primeiraRetornoFocApi) return true;
@@ -5803,6 +6208,7 @@ const EscalaService = {
   },
 
   obterIdsAfastamentosMaisRecentesPorClasse: (transaction) => obterIdsAfastamentosMaisRecentesPorClasse(transaction),
+  enriquecerRelevanciaEscalaAtivaAfastamentos: (lista) => enriquecerRelevanciaEscalaAtivaAfastamentos(lista),
 
   listarPermutas: async (usuarioId, verTodasComoAdmin) => {
     const where = verTodasComoAdmin
@@ -7307,6 +7713,19 @@ EscalaService.__testables = {
   afastamentoFeriasOuAbonoEntraNoRodizio,
   abonoMudaAlgumPlantaoDoRodizio,
   afastamentosListaParaRodizioEscala,
+  obterEscalasAbertasRelevancia,
+  montarContextoRelevanciaEscala,
+  obterContextoRelevanciaEscalaAtiva,
+  resolverContextoRelevanciaAfastamento,
+  afastamentoFeriasOuAbonoTitularEscaladoNoPeriodoSemAfastamento,
+  afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao,
+  afastamentoFeriasOuAbonoContribuiParaCalendarioGravado,
+  afastamentosListaSemRegistro,
+  afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem,
+  afastamentoFeriasOuAbonoRelevanteParaTagEscala,
+  afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro,
+  classificarRelevanciaAfastamentoEscalaAtiva,
+  enriquecerRelevanciaEscalaAtivaAfastamentos,
 };
 
 module.exports = EscalaService;

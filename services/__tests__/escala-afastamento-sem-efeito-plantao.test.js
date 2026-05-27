@@ -49,6 +49,15 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
     afastamentoFeriasOuAbonoEntraNoRodizio,
     abonoMudaAlgumPlantaoDoRodizio,
     montarParametrosFiltroAfastamentoPlantoes,
+    classificarRelevanciaAfastamentoEscalaAtiva,
+    afastamentoFeriasOuAbonoRelevanteNoRodizio,
+    afastamentoFeriasOuAbonoRedundanteNoCalendario,
+    afastamentoFeriasOuAbonoContribuiParaCalendarioGravado,
+    afastamentoFeriasOuAbonoTitularEscaladoNoPeriodoSemAfastamento,
+    afastamentoFeriasOuAbonoRelevanteParaTagEscala,
+    afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro,
+    afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem,
+    afastamentosListaParaRodizioEscala,
   } = EscalaService.__testables;
 
   const ORDEM_VET = [101, 102, 103, 104, 105, 106, 107, 108];
@@ -141,6 +150,188 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
     expect(afastamentosEfetivosRodizioEscala(afs, p)).toHaveLength(0);
   });
 
+  test('abono Ana 17/07 após Ana+Daniel+Gabriela: tag irrelevante', () => {
+    const DATAS_JUN_JUL = [
+      '2026-06-06',
+      '2026-06-07',
+      '2026-06-13',
+      '2026-06-14',
+      '2026-06-20',
+      '2026-06-21',
+      '2026-06-27',
+      '2026-06-28',
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afAna = { id: 1, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDaniel = { id: 2, usuarioId: D, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' };
+    const afGabriela = {
+      id: 3,
+      usuarioId: G,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-06-17',
+      dataFim: '2026-06-24',
+    };
+    const afAnaJul = { id: 4, usuarioId: A, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-17', dataFim: '2026-07-17' };
+    const brutosAnteriores = [afAna, afDaniel, afGabriela];
+    const plantoes = plantoesGravadosVet(ORDEM, DATAS_JUN_JUL, brutosAnteriores);
+    const brutos = [...brutosAnteriores, afAnaJul];
+    const p = params(brutos, { datas: DATAS_JUN_JUL, plantoes });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-07-31', paramsFiltro: p };
+    expect(afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem(afAnaJul, p)).toBe(true);
+    expect(afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(afAnaJul, p, ctx.dataFimStr)).toBe(false);
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afAnaJul, ctx)).toBe('irrelevante');
+  });
+
+  test('abono Ana 17/07 (plantão só 25/07): tag irrelevante com escala já ajustada', () => {
+    const DATAS_JUN_JUL = [
+      '2026-06-06',
+      '2026-06-07',
+      '2026-06-13',
+      '2026-06-14',
+      '2026-06-20',
+      '2026-06-21',
+      '2026-06-27',
+      '2026-06-28',
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afAna = { id: 1, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDaniel = { id: 2, usuarioId: D, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' };
+    const afGabriela = {
+      id: 3,
+      usuarioId: G,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-06-17',
+      dataFim: '2026-06-24',
+    };
+    const afAnaJul = { id: 100, usuarioId: A, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-17', dataFim: '2026-07-17' };
+    const plantoes = plantoesGravadosVet(ORDEM, DATAS_JUN_JUL, [afAna, afDaniel, afGabriela]);
+    const p = params([afAna, afDaniel, afGabriela, afAnaJul], { datas: DATAS_JUN_JUL, plantoes });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-07-31', paramsFiltro: p };
+    expect(afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem(afAnaJul, p)).toBe(true);
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afAnaJul, ctx)).toBe('irrelevante');
+  });
+
+  test('abono Diego 17/06 com plantões gravados com vagaIndice=0 (igual produção): tag irrelevante', () => {
+    /**
+     * Reproduz a chave de produção: o banco grava `vaga_indice = 0` (default do modelo) em todo
+     * plantão veterinário. Sem normalizar a chave em ambos os mapas, `sem.get(...)` retornaria
+     * undefined em produção e a tag virava "Relevante" indevidamente.
+     */
+    const afAna = { id: 1, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDiego = { id: 2, usuarioId: D, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-17', dataFim: '2026-06-17' };
+    const plantoesSemVaga = plantoesGravadosVet(ORDEM, DATAS_JUN, [afAna]);
+    const plantoesComVaga = plantoesSemVaga.map((p) => ({ ...p, vagaIndice: 0 }));
+    const p = params([afAna, afDiego], { datas: DATAS_JUN, plantoes: plantoesComVaga });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-06-30', paramsFiltro: p };
+    expect(afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(afDiego, p, ctx.dataFimStr)).toBe(false);
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afDiego, ctx)).toBe('irrelevante');
+  });
+
+  test('abono Diego 17/06 após férias Ana (Diego em 13/06): tag irrelevante (escala jun-jul)', () => {
+    const DATAS_JUN_JUL = [
+      '2026-06-06',
+      '2026-06-07',
+      '2026-06-13',
+      '2026-06-14',
+      '2026-06-20',
+      '2026-06-21',
+      '2026-06-27',
+      '2026-06-28',
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afAna = { id: 1, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    /** Abono em qua, Diego (D=104) escalado 13/06 (sáb) com retro-cadastro liberado por dia útil intermediário. */
+    const afDiego = { id: 2, usuarioId: D, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-17', dataFim: '2026-06-17' };
+    const plantoes = plantoesGravadosVet(ORDEM, DATAS_JUN_JUL, [afAna]);
+    const p = params([afAna, afDiego], { datas: DATAS_JUN_JUL, plantoes });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-07-31', paramsFiltro: p };
+    expect(afastamentosListaParaRodizioEscala([afAna, afDiego], p).map((a) => a.id)).toEqual([1]);
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afDiego, ctx)).toBe('irrelevante');
+  });
+
+  test('abono Ana 15/07 (dia útil, sem plantão dela) não entra no rodízio nem move outros plantões', () => {
+    const DATAS_JUN_JUL = [
+      '2026-06-06',
+      '2026-06-07',
+      '2026-06-13',
+      '2026-06-14',
+      '2026-06-20',
+      '2026-06-21',
+      '2026-06-27',
+      '2026-06-28',
+      '2026-07-04',
+      '2026-07-05',
+      '2026-07-11',
+      '2026-07-12',
+      '2026-07-18',
+      '2026-07-19',
+      '2026-07-25',
+      '2026-07-26',
+    ];
+    const afAna = { id: 1, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDaniel = { id: 2, usuarioId: D, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' };
+    const afGabriela = {
+      id: 3,
+      usuarioId: G,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-06-17',
+      dataFim: '2026-06-24',
+    };
+    /** Abono em quarta-feira, fora do plantão dela em 25/07. Não pode forçar retorno fictício em 18/07. */
+    const afAnaJul = { id: 200, usuarioId: A, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-15', dataFim: '2026-07-15' };
+    const brutosAnteriores = [afAna, afDaniel, afGabriela];
+    const plantoes = plantoesGravadosVet(ORDEM, DATAS_JUN_JUL, brutosAnteriores);
+    const brutos = [...brutosAnteriores, afAnaJul];
+    const p = params(brutos, { datas: DATAS_JUN_JUL, plantoes });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-07-31', paramsFiltro: p };
+
+    expect(afastamentoFeriasOuAbonoTitularEscaladoNoPeriodoSemAfastamento(afAnaJul, p)).toBe(false);
+    expect(afastamentosListaParaRodizioEscala(brutos, p).map((a) => a.id)).toEqual(
+      brutosAnteriores.map((a) => a.id),
+    );
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afAnaJul, ctx)).toBe('irrelevante');
+
+    const semNovo = simularRodizioVetPlantoes(ORDEM, DATAS_JUN_JUL, brutosAnteriores, new Set());
+    const comNovo = simularRodizioVetPlantoes(ORDEM, DATAS_JUN_JUL, brutos, new Set());
+    /** Sem o filtro, `comNovo` aloca Ana em 18/07 e Daniel é empurrado para 19/07. */
+    expect(comNovo.alocacoes.map((a) => a.usuarioId)).not.toEqual(
+      semNovo.alocacoes.map((a) => a.usuarioId),
+    );
+
+    const afastamentosFiltrados = afastamentosListaParaRodizioEscala(brutos, p);
+    const comFiltrado = simularRodizioVetPlantoes(
+      ORDEM,
+      DATAS_JUN_JUL,
+      afastamentosFiltrados,
+      new Set(),
+    );
+    /** Após o filtro, o calendário fica idêntico ao gravado (sem o abono neutro). */
+    expect(comFiltrado.alocacoes.map((a) => a.usuarioId)).toEqual(
+      semNovo.alocacoes.map((a) => a.usuarioId),
+    );
+  });
+
   test('abono Ana 17/06 (dia sem plantão) em escala jun–jul alfabética: irrelevante', () => {
     const DATAS_JUN_JUL = [
       '2026-06-06',
@@ -184,6 +375,80 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
     const p = params(afs, { plantoes });
     expect(afastamentoFeriasOuAbonoAlteraPlantoesDoUsuario(afs[0], p)).toBe(true);
     expect(filtrarAfastamentosFeriasAbonoSemEfeitoEmPlantoes(afs, p)).toHaveLength(1);
+  });
+
+  test('férias Ana 08–19: tag relevante (plantão 06/06 na janela retroativa)', () => {
+    const afs = [
+      { id: 2, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-08', dataFim: '2026-06-19' },
+    ];
+    const plantoes = plantoesGravadosVet(ORDEM, DATAS_JUN, afs);
+    const p = params(afs, { plantoes });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-06-30', paramsFiltro: p };
+    expect(afastamentoFeriasOuAbonoRelevanteParaTagEscala(afs[0], p)).toBe(true);
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afs[0], ctx)).toBe('relevante');
+  });
+
+  test('abono Daniel 12/06 após Ana: tag relevante (efeito no plantão 13/06)', () => {
+    const { simularRodizioVetPlantoes, sincronizarCalendarioRodizioPlenoEscalaBimestre } =
+      EscalaService.__testables;
+    const afAna = {
+      id: 1,
+      usuarioId: A,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-06-05',
+      dataFim: '2026-06-19',
+    };
+    const afDaniel = {
+      id: 2,
+      usuarioId: D,
+      tipo: { tipo: 'Abono' },
+      dataInicio: '2026-06-12',
+      dataFim: '2026-06-12',
+    };
+    const gravadosSoAna = simularRodizioVetPlantoes(ORDEM, DATAS_JUN, [afAna], new Set()).alocacoes.map((a) => ({
+      dataReferencia: a.dataIso,
+      categoriaPlantao: 'veterinario',
+      usuarioId: a.usuarioId,
+    }));
+    const brutos = [afAna, afDaniel];
+    const p = params(brutos, { plantoes: gravadosSoAna });
+    const efetivos = afastamentosEfetivosRodizioEscala(brutos, p);
+    const afPleno = afastamentosParaSimulacaoPlenaCategoria(brutos, efetivos, p, 'veterinario');
+    const plantoesDb = gravadosSoAna.map((row, i) => ({ ...row, id: i + 1 }));
+    sincronizarCalendarioRodizioPlenoEscalaBimestre({
+      plantoes: plantoesDb,
+      ordemVetInicial: ORDEM,
+      ordemTecInicial: [],
+      afastamentosFlat: afPleno,
+      datasNaoUteisIsoSet: p.datasNaoUteisIsoSet,
+      categoriaPorUsuarioId: p.categoriaPorUsuarioId,
+      sincronizarVet: true,
+      sincronizarTec: false,
+    });
+    const pComCal = params(brutos, {
+      plantoes: plantoesDb.map((row) => ({
+        dataReferencia: row.dataReferencia,
+        categoriaPlantao: 'veterinario',
+        usuarioId: row.usuarioId,
+      })),
+    });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-06-30', paramsFiltro: pComCal };
+    expect(afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(afDaniel, pComCal, ctx.dataFimStr)).toBe(
+      true,
+    );
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afDaniel, ctx)).toBe('relevante');
+  });
+
+  test('férias Ana: tag relevante quando calendário já reflete o afastamento', () => {
+    const afs = [
+      { id: 2, usuarioId: A, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' },
+    ];
+    const plantoes = plantoesGravadosVet(ORDEM, DATAS_JUN, afs);
+    const p = params(afs, { plantoes });
+    const ctx = { dataInicioStr: '2026-06-01', dataFimStr: '2026-06-30', paramsFiltro: p };
+    expect(afastamentoFeriasOuAbonoRelevanteParaTagEscala(afs[0], p, ctx.dataFimStr)).toBe(true);
+    expect(afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(afs[0], p, ctx.dataFimStr)).toBe(true);
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afs[0], ctx)).toBe('relevante');
   });
 
   test('abono Diego permanece no rodízio após férias Fernanda (14/06 sem Diego)', () => {
@@ -684,5 +949,166 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
     });
     expect(afastamentoFeriasOuAbonoAlteraPlantoesDoUsuario(afs[0], pAntes)).toBe(true);
     expect(filtrarAfastamentosFeriasAbonoSemEfeitoEmPlantoes(afs, pAntes)).toHaveLength(1);
+  });
+
+  /**
+   * Regressão (isolamento entre categorias):
+   * Abono de técnico (Álvaro 18/06) não pode marcar plantão vet como "exige recálculo focado".
+   * O mapa `retornosFeriasNoPrimeiroPlantao` é compartilhado entre vet/téc; sem o filtro de
+   * pertencimento à ordem da categoria do plantão, `plantaoRequerRecalculoFocado(Vet/Tec)`
+   * retornava true em datas onde o titular tec aparecia no mapa, contaminando o calendário vet.
+   */
+  test('abono de técnico não exige recálculo focado em plantões vet (isolamento entre categorias)', () => {
+    const { plantaoRequerRecalculoFocado, montarRetornosFeriasNoPrimeiroPlantao } = EscalaService.__testables;
+    const ORDEM_VET_ISO = [101, 102, 103, 104, 105, 106, 107, 108];
+    const ALVARO_TEC = 999;
+    const afAlvaro = {
+      id: 99,
+      usuarioId: ALVARO_TEC,
+      tipo: { tipo: 'Abono' },
+      dataInicio: '2026-06-18',
+      dataFim: '2026-06-18',
+    };
+    /** Plantões gravados com técnicos só para popular o mapa de retornos em data útil. */
+    const plantoesParaRetornos = [
+      ...DATAS_JUN_VET.map((d) => ({ dataReferencia: d, categoriaPlantao: 'veterinario', usuarioId: 101 })),
+      { dataReferencia: '2026-06-06', categoriaPlantao: 'tecnico', usuarioId: ALVARO_TEC, vagaIndice: 0 },
+      { dataReferencia: '2026-06-20', categoriaPlantao: 'tecnico', usuarioId: 998, vagaIndice: 0 },
+    ];
+    const categoriaPorUsuarioId = new Map([
+      ...ORDEM_VET_ISO.map((id) => [id, 'veterinario']),
+      [ALVARO_TEC, 'tecnico'],
+      [998, 'tecnico'],
+    ]);
+    const retornos = montarRetornosFeriasNoPrimeiroPlantao(
+      [afAlvaro],
+      plantoesParaRetornos,
+      new Set(),
+      categoriaPorUsuarioId,
+    );
+    /** Sanidade: Álvaro entra no mapa em alguma data útil após 18/06 (técnico, mas mapa é compartilhado). */
+    const usuariosNoMapa = [...retornos.values()].flat().map(Number);
+    expect(usuariosNoMapa).toContain(ALVARO_TEC);
+
+    /** Para plantões vet, recálculo focado por Álvaro (técnico) deve sempre retornar false. */
+    for (const dataReferencia of DATAS_JUN_VET) {
+      const plantaoVet = { dataReferencia, categoriaPlantao: 'veterinario', usuarioId: 101 };
+      expect(
+        plantaoRequerRecalculoFocado(
+          ALVARO_TEC,
+          plantaoVet,
+          dataReferencia,
+          ORDEM_VET_ISO,
+          retornos,
+          new Map(),
+          new Set(),
+          afAlvaro,
+          [],
+          DATAS_JUN_VET,
+        ),
+      ).toBe(false);
+    }
+  });
+
+  /**
+   * Regressão (filtro do rodízio preserva afastamentos vet relevantes):
+   * Após Ana/Diego/Gabriela já refletidos no calendário gravado (BCEFDHAG em jun+jul), o filtro
+   * `afastamentosListaParaRodizioEscala` deve manter Ana, Diego e Gabriela (titulares perdem plantão)
+   * e remover apenas o abono Álvaro do técnico (titular não perde plantão). Antes da correção,
+   * `Redundante` filtrava todos os 3 vet também, deixando a re-simulação plena rodar sem afastamentos
+   * e sobrescrever o calendário vet para ordem alfabética genérica.
+   */
+  test('filtro do rodízio: abono Álvaro tec irrelevante remove só Álvaro, mantém Ana/Diego/Gabriela vet', () => {
+    const ORDEM_VET_ALF = [101, 102, 103, 104, 105, 106, 107, 108];
+    const ORDEM_TEC_ALF = [201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216];
+    const DATAS_JUN_JUL = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const afAna = { id: 1, usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDiego = { id: 2, usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' };
+    const afGab = { id: 3, usuarioId: 107, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-17', dataFim: '2026-06-24' };
+    const afAlvaro = { id: 4, usuarioId: 201, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-18', dataFim: '2026-06-18' };
+
+    const semAlvaroVet = simularRodizioVetPlantoes(ORDEM_VET_ALF, DATAS_JUN_JUL, [afAna, afDiego, afGab], new Set());
+    const semAlvaroTec = simularRodizioTecPlantoes(ORDEM_TEC_ALF, DATAS_JUN_JUL, [], new Set());
+    const plantoesGravados = [
+      ...semAlvaroVet.alocacoes.map((a) => ({ dataReferencia: a.dataIso, categoriaPlantao: 'veterinario', usuarioId: a.usuarioId })),
+      ...semAlvaroTec.alocacoes.map((a) => ({ dataReferencia: a.dataIso, categoriaPlantao: 'tecnico', usuarioId: a.usuarioId, vagaIndice: a.vagaIndice })),
+    ];
+    const categoriaPorUsuarioId = new Map([
+      ...ORDEM_VET_ALF.map((id) => [id, 'veterinario']),
+      ...ORDEM_TEC_ALF.map((id) => [id, 'tecnico']),
+    ]);
+    const params = montarParametrosFiltroAfastamentoPlantoes({
+      plantoes: plantoesGravados,
+      ordemVetInicial: ORDEM_VET_ALF,
+      ordemTecInicial: ORDEM_TEC_ALF,
+      afastamentosLista: [afAna, afDiego, afGab, afAlvaro],
+      periodicidadeEscala: 'fim_de_semana',
+      categoriaPorUsuarioId,
+    });
+    const filtrados = afastamentosListaParaRodizioEscala([afAna, afDiego, afGab, afAlvaro], params);
+    const ids = filtrados.map((a) => Number(a.id)).sort();
+    expect(ids).toEqual([1, 2, 3]);
+
+    /** Re-simulação plena com os 3 vet relevantes preserva o calendário vet BCEFDHAG em jun+jul. */
+    const reSim = simularRodizioVetPlantoes(ORDEM_VET_ALF, DATAS_JUN_JUL, filtrados, new Set());
+    const LETRA = { 101: 'A', 102: 'B', 103: 'C', 104: 'D', 105: 'E', 106: 'F', 107: 'G', 108: 'H' };
+    const seq = DATAS_JUN_JUL.map((d) => {
+      const a = reSim.alocacoes.find((x) => x.dataIso === d);
+      return a ? LETRA[a.usuarioId] : '?';
+    }).join('');
+    expect(seq).toBe('BCEFDHAGBCEFDHAG');
+  });
+
+  /**
+   * Simetria do isolamento: abono vet não pode marcar plantão tec como "exige recálculo focado".
+   */
+  test('abono de veterinário não exige recálculo focado em plantões téc (isolamento entre categorias)', () => {
+    const { plantaoRequerRecalculoFocado, montarRetornosFeriasNoPrimeiroPlantao } = EscalaService.__testables;
+    const ORDEM_TEC_ISO = [201, 202, 203, 204, 205, 206];
+    const ANA_VET = 101;
+    const afAna = {
+      id: 11,
+      usuarioId: ANA_VET,
+      tipo: { tipo: 'Abono' },
+      dataInicio: '2026-06-17',
+      dataFim: '2026-06-17',
+    };
+    const plantoesParaRetornos = [
+      { dataReferencia: '2026-06-13', categoriaPlantao: 'veterinario', usuarioId: ANA_VET },
+      { dataReferencia: '2026-06-20', categoriaPlantao: 'veterinario', usuarioId: ANA_VET },
+      { dataReferencia: '2026-06-20', categoriaPlantao: 'tecnico', usuarioId: 201, vagaIndice: 0 },
+    ];
+    const categoriaPorUsuarioId = new Map([
+      [ANA_VET, 'veterinario'],
+      ...ORDEM_TEC_ISO.map((id) => [id, 'tecnico']),
+    ]);
+    const retornos = montarRetornosFeriasNoPrimeiroPlantao(
+      [afAna],
+      plantoesParaRetornos,
+      new Set(),
+      categoriaPorUsuarioId,
+    );
+    for (const dataReferencia of ['2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28']) {
+      const plantaoTec = { dataReferencia, categoriaPlantao: 'tecnico', usuarioId: 201, vagaIndice: 0 };
+      expect(
+        plantaoRequerRecalculoFocado(
+          ANA_VET,
+          plantaoTec,
+          dataReferencia,
+          ORDEM_TEC_ISO,
+          retornos,
+          new Map(),
+          new Set(),
+          afAna,
+          [],
+          ['2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14', '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28'],
+        ),
+      ).toBe(false);
+    }
   });
 });
