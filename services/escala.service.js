@@ -874,6 +874,19 @@ function montarRetornosFeriasNoPrimeiroPlantao(
       (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds, datasNaoUteisIsoSet),
     );
     if (!primeiraDataPosRetorno) continue;
+    /**
+     * Só faz sentido forçar retorno quando o afastamento bloqueia alguma data de plantão
+     * (ativo, retro-cadastro ou pós-fim sem dia útil intermediário). Caso contrário, o motor
+     * acabava deslocando o rodízio por um afastamento que nem fazia o titular perder plantão
+     * (ex.: abono em dia útil distante do plantão), contaminando simulações dependentes.
+     */
+    const apenasEsse = montarAfastamentosPorUsuario([af]);
+    const bloqueiaAlgumPlantao = plantoes.some((p) => {
+      const ds = dataReferenciaParaStr(p.dataReferencia ?? p.dataIso);
+      if (!ds) return false;
+      return usuarioIndisponivelParaPlantaoNoDia(apenasEsse, usuarioId, ds, datasNaoUteisIsoSet);
+    });
+    if (!bloqueiaAlgumPlantao) continue;
     candidatos.push({
       usuarioId,
       primeiraDataPosRetorno,
@@ -4936,9 +4949,40 @@ async function recalcularEscalaInterno(
     }
   }
 
+  /**
+   * Isolamento entre categorias no fluxo "geral" (sem modo focado): quando o afastamento
+   * focado é claramente de uma categoria (vet ou téc) e há outros afastamentos prévios na
+   * escala, plantões da OUTRA categoria não devem ser reprocessados — a fila gravada nos
+   * membros pode estar desalinhada com o calendário gravado por sincronizações prévias em
+   * modo focado, e re-simular vet a partir dessa fila + idx=0 produz calendário fora do
+   * que está gravado, atribuindo o titular a datas onde ele tem abono cadastrado.
+   */
+  const usuarioIdFocadoIsolamento =
+    historicoMotivo === 'afastamento' && historicoAfastamento && !modoRecalculoFocado
+      ? Number(
+          (historicoAfastamento.get && historicoAfastamento.get({ plain: true })?.usuarioId) ??
+            historicoAfastamento.usuarioId,
+        )
+      : null;
+  const afastamentoFocadoEhVet =
+    Number.isFinite(usuarioIdFocadoIsolamento) &&
+    ordemAtualDbInicialVet.includes(usuarioIdFocadoIsolamento);
+  const afastamentoFocadoEhTec =
+    Number.isFinite(usuarioIdFocadoIsolamento) &&
+    ordemAtualDbInicialTec.includes(usuarioIdFocadoIsolamento);
+  const isolarCategoriaOposta =
+    !modoRecalculoFocado && (afastamentoFocadoEhVet !== afastamentoFocadoEhTec);
+  const categoriaPreservadaIsolamento = isolarCategoriaOposta
+    ? (afastamentoFocadoEhTec ? CATEGORIA_PLANTAO.VETERINARIO : CATEGORIA_PLANTAO.TECNICO)
+    : null;
+
   for (const plantao of plantoes) {
     const dataIso = dataReferenciaParaStr(plantao.dataReferencia);
     const catPlantao = categoriaPlantaoDe(plantao);
+
+    if (isolarCategoriaOposta && catPlantao === categoriaPreservadaIsolamento) {
+      continue;
+    }
 
     let ordemAtual = catPlantao === CATEGORIA_PLANTAO.TECNICO ? ordemAtualTec : ordemAtualVet;
     let ordemGlobal = catPlantao === CATEGORIA_PLANTAO.TECNICO ? ordemGlobalTec : ordemGlobalVet;

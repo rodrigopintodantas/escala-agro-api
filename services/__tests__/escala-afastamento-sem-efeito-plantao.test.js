@@ -57,6 +57,7 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
     afastamentoFeriasOuAbonoRelevanteParaTagEscala,
     afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro,
     afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem,
+    afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao,
     afastamentosListaParaRodizioEscala,
   } = EscalaService.__testables;
 
@@ -314,8 +315,12 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
 
     const semNovo = simularRodizioVetPlantoes(ORDEM, DATAS_JUN_JUL, brutosAnteriores, new Set());
     const comNovo = simularRodizioVetPlantoes(ORDEM, DATAS_JUN_JUL, brutos, new Set());
-    /** Sem o filtro, `comNovo` aloca Ana em 18/07 e Daniel é empurrado para 19/07. */
-    expect(comNovo.alocacoes.map((a) => a.usuarioId)).not.toEqual(
+    /**
+     * O motor agora também ignora afastamentos sem efeito em plantão (não bloqueia nenhuma
+     * data útil de plantão), então o calendário produzido com ou sem `afAnaJul` é idêntico —
+     * defesa em profundidade contra contaminação do rodízio por afastamentos irrelevantes.
+     */
+    expect(comNovo.alocacoes.map((a) => a.usuarioId)).toEqual(
       semNovo.alocacoes.map((a) => a.usuarioId),
     );
 
@@ -326,7 +331,7 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
       afastamentosFiltrados,
       new Set(),
     );
-    /** Após o filtro, o calendário fica idêntico ao gravado (sem o abono neutro). */
+    /** Após o filtro, o calendário continua idêntico ao gravado (sem o abono neutro). */
     expect(comFiltrado.alocacoes.map((a) => a.usuarioId)).toEqual(
       semNovo.alocacoes.map((a) => a.usuarioId),
     );
@@ -959,7 +964,7 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
    * retornava true em datas onde o titular tec aparecia no mapa, contaminando o calendário vet.
    */
   test('abono de técnico não exige recálculo focado em plantões vet (isolamento entre categorias)', () => {
-    const { plantaoRequerRecalculoFocado, montarRetornosFeriasNoPrimeiroPlantao } = EscalaService.__testables;
+    const { plantaoRequerRecalculoFocado } = EscalaService.__testables;
     const ORDEM_VET_ISO = [101, 102, 103, 104, 105, 106, 107, 108];
     const ALVARO_TEC = 999;
     const afAlvaro = {
@@ -969,28 +974,14 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
       dataInicio: '2026-06-18',
       dataFim: '2026-06-18',
     };
-    /** Plantões gravados com técnicos só para popular o mapa de retornos em data útil. */
-    const plantoesParaRetornos = [
-      ...DATAS_JUN_VET.map((d) => ({ dataReferencia: d, categoriaPlantao: 'veterinario', usuarioId: 101 })),
-      { dataReferencia: '2026-06-06', categoriaPlantao: 'tecnico', usuarioId: ALVARO_TEC, vagaIndice: 0 },
-      { dataReferencia: '2026-06-20', categoriaPlantao: 'tecnico', usuarioId: 998, vagaIndice: 0 },
-    ];
-    const categoriaPorUsuarioId = new Map([
-      ...ORDEM_VET_ISO.map((id) => [id, 'veterinario']),
-      [ALVARO_TEC, 'tecnico'],
-      [998, 'tecnico'],
-    ]);
-    const retornos = montarRetornosFeriasNoPrimeiroPlantao(
-      [afAlvaro],
-      plantoesParaRetornos,
-      new Set(),
-      categoriaPorUsuarioId,
-    );
-    /** Sanidade: Álvaro entra no mapa em alguma data útil após 18/06 (técnico, mas mapa é compartilhado). */
-    const usuariosNoMapa = [...retornos.values()].flat().map(Number);
-    expect(usuariosNoMapa).toContain(ALVARO_TEC);
+    /**
+     * Cenário: ainda que o mapa de retornos (compartilhado entre vet/téc) eventualmente contivesse
+     * o usuário técnico, o recálculo focado em plantões vet não pode disparar quando o titular
+     * não pertence à ordem vet. Inserimos Álvaro manualmente no mapa para isolar o cenário sem
+     * depender de como `montarRetornosFeriasNoPrimeiroPlantao` decide criar a entrada.
+     */
+    const retornos = new Map(DATAS_JUN_VET.map((d) => [d, [ALVARO_TEC]]));
 
-    /** Para plantões vet, recálculo focado por Álvaro (técnico) deve sempre retornar false. */
     for (const dataReferencia of DATAS_JUN_VET) {
       const plantaoVet = { dataReferencia, categoriaPlantao: 'veterinario', usuarioId: 101 };
       expect(
@@ -1110,5 +1101,78 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
         ),
       ).toBe(false);
     }
+  });
+
+  /**
+   * Regressão (`montarRetornosFeriasNoPrimeiroPlantao` ignora afastamentos sem efeito):
+   *
+   * Cenário do usuário: escala vet jun-jul ABCDEFGH, após Ana(05-19/06 férias) + Diego(12/06 abono)
+   * + Gabriela(17-24/06 férias) + Ana(17/07 abono) + Henrique(17/07 abono), o calendário gravado é
+   * BCEFDHAG em junho e BCEFDGAH em julho. Ao cadastrar abono Henrique 11/06 (quarta-feira, sem
+   * plantão dela em junho — Henrique escalado em 21/06 e o pós-fim 11/06 tem 12/06 sex útil
+   * intermediário, logo nada bloqueia 21/06), o motor antes criava entrada de retorno fictícia
+   * em 13/06 para Henrique, deslocando todo o rodízio (e escalando Gabriela durante suas próprias
+   * férias). Agora, como o abono não bloqueia nenhum plantão dela, `montarRetornos` ignora o
+   * candidato e o calendário permanece BCEFDHAG/BCEFDGAH (mesmo do passo anterior).
+   */
+  test('abono Henrique 11/06 (irrelevante) não deve alterar calendário BCEFDHAG/BCEFDGAH', () => {
+    const ORDEM_VET = [101, 102, 103, 104, 105, 106, 107, 108];
+    const LETRA = { 101: 'A', 102: 'B', 103: 'C', 104: 'D', 105: 'E', 106: 'F', 107: 'G', 108: 'H' };
+    const DATAS = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const seq = (alocs) =>
+      DATAS.map((d) => {
+        const a = alocs.find((x) => x.dataIso === d);
+        return a ? LETRA[a.usuarioId] : '?';
+      }).join('');
+
+    const afAna = { id: 1, usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDiego = { id: 2, usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' };
+    const afGab = { id: 3, usuarioId: 107, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-17', dataFim: '2026-06-24' };
+    const afAna17jul = { id: 4, usuarioId: 101, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-17', dataFim: '2026-07-17' };
+    const afHen17jul = { id: 5, usuarioId: 108, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-17', dataFim: '2026-07-17' };
+    const afHen11jun = { id: 6, usuarioId: 108, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-11', dataFim: '2026-06-11' };
+
+    const semHen11 = simularRodizioVetPlantoes(
+      ORDEM_VET,
+      DATAS,
+      [afAna, afDiego, afGab, afAna17jul, afHen17jul],
+      new Set(),
+    );
+    expect(seq(semHen11.alocacoes)).toBe('BCEFDHAGBCEFDGAH');
+
+    const comHen11 = simularRodizioVetPlantoes(
+      ORDEM_VET,
+      DATAS,
+      [afAna, afDiego, afGab, afAna17jul, afHen17jul, afHen11jun],
+      new Set(),
+    );
+    expect(seq(comHen11.alocacoes)).toBe(seq(semHen11.alocacoes));
+
+    const plantoes = semHen11.alocacoes.map((a) => ({
+      dataReferencia: a.dataIso,
+      categoriaPlantao: 'veterinario',
+      usuarioId: a.usuarioId,
+    }));
+    const cat = new Map(ORDEM_VET.map((id) => [id, 'veterinario']));
+    const todos = [afAna, afDiego, afGab, afAna17jul, afHen17jul, afHen11jun];
+    const p = montarParametrosFiltroAfastamentoPlantoes({
+      plantoes,
+      ordemVetInicial: ORDEM_VET,
+      ordemTecInicial: [],
+      afastamentosLista: todos,
+      periodicidadeEscala: 'fim_de_semana',
+      categoriaPorUsuarioId: cat,
+    });
+
+    expect(afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(afHen11jun, p)).toBe(false);
+    expect(afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(afGab, p)).toBe(true);
+
+    const filtrados = afastamentosListaParaRodizioEscala(todos, p);
+    expect(filtrados.map((a) => Number(a.id)).sort()).toEqual([1, 2, 3, 4, 5]);
   });
 });
