@@ -2393,6 +2393,32 @@ function mapasRodizioComESemAfastamento(af, params) {
   return { com: mapaAlocacoesRodizio(com), sem: mapaAlocacoesRodizio(sem), cat };
 }
 
+/**
+ * Versão consistente com o recálculo total: filtra fora os afastamentos sem efeito (que NÃO
+ * tiram plantão do titular) antes de simular. Sem essa filtragem, o "retorno forçado pós-férias"
+ * do simulador é disparado para afastamentos irrelevantes (ex.: férias 30/06–10/07 de quem
+ * estava escalado fora desse intervalo) e gera diferenças entre `com`/`sem` que rotulam o
+ * afastamento como relevante na tag — mesmo o recálculo dizendo o contrário.
+ *
+ * Usada apenas pelas funções de classificação de relevância da TAG (`com` vs `sem`). NÃO usar
+ * em `afastamentoFeriasOuAbonoRelevanteNoRodizio`, que compara `com` com o calendário GRAVADO:
+ * lá o `com` precisa ser a simulação completa (incluindo retornos forçados) para casar com o
+ * que o motor grava de fato.
+ */
+function mapasRodizioComESemAfastamentoConsistente(af, params) {
+  const plainAf = af && af.get ? af.get({ plain: true }) : af;
+  const cat = categoriaAfastamentoUsuarioFiltro(params, plainAf.usuarioId);
+  const outros = afastamentosListaSemRegistro(plainAf, params.afastamentosLista);
+  const paramsOutros = { ...params, afastamentosLista: outros };
+  const outrosFiltrados = afastamentosListaParaRodizioEscala(outros, paramsOutros);
+  const todos = [...outros, plainAf];
+  const paramsComEste = { ...params, afastamentosLista: todos };
+  const comFiltrados = afastamentosListaParaRodizioEscala(todos, paramsComEste);
+  const com = simularAlocacoesRodizioCategoria(params, cat, comFiltrados);
+  const sem = simularAlocacoesRodizioCategoria(params, cat, outrosFiltrados);
+  return { com: mapaAlocacoesRodizio(com), sem: mapaAlocacoesRodizio(sem), cat };
+}
+
 function mapaPlantoesGravadosCategoria(params, categoria) {
   const mapa = new Map();
   for (const p of params.plantoes || []) {
@@ -2833,7 +2859,7 @@ function afastamentoFeriasOuAbonoRelevanteParaTagEscala(af, params, escalaFimStr
   if (!Number.isFinite(uid) || uid < 1) return true;
   const { inicioIso, fimCadastro } = periodoRetroAfastamentoParaTag(plainAf, params, escalaFimStr);
   const cat = categoriaAfastamentoUsuarioFiltro(params, plainAf.usuarioId);
-  const { com, sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  const { com, sem } = mapasRodizioComESemAfastamentoConsistente(plainAf, params);
   const chaves = new Set([...com.keys(), ...sem.keys()]);
   for (const k of chaves) {
     const ds = String(k).includes('|') ? String(k).split('|')[0] : String(k);
@@ -2851,7 +2877,7 @@ function afastamentoFeriasOuAbonoRelevanteParaTagEscala(af, params, escalaFimStr
 function afastamentoFeriasOuAbonoNaoAlteraRodizioComVsSem(af, params) {
   if (!afastamentoEhFerias(af) && !afastamentoEhAbono(af)) return false;
   const plainAf = af && af.get ? af.get({ plain: true }) : af;
-  const { com, sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  const { com, sem } = mapasRodizioComESemAfastamentoConsistente(plainAf, params);
   const chaves = new Set([...com.keys(), ...sem.keys()]);
   for (const k of chaves) {
     if (Number(com.get(k)) !== Number(sem.get(k))) return false;
@@ -2868,7 +2894,7 @@ function afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro(af, params, e
   const { inicioIso, fimLimiteEscala } = periodoRetroAfastamentoParaTag(plainAf, params, escalaFimStr);
   const cat = categoriaAfastamentoUsuarioFiltro(params, plainAf.usuarioId);
   const gravados = mapaPlantoesGravadosCategoria(params, cat);
-  const { com, sem } = mapasRodizioComESemAfastamento(plainAf, params);
+  const { com, sem } = mapasRodizioComESemAfastamentoConsistente(plainAf, params);
   for (const [k, uidGrav] of gravados) {
     const ds = String(k).includes('|') ? String(k).split('|')[0] : String(k);
     if (ds < inicioIso || ds > fimLimiteEscala) continue;
@@ -6174,6 +6200,456 @@ async function restaurarEstadoAntesAfastamento(afastamentoPlain, transaction) {
 }
 
 /**
+ * Núcleo puro do recálculo total. Recebe TODAS as entradas já carregadas e produz o resultado
+ * esperado (alocações, ordem final, diffs) sem tocar no BD. Facilita testar sem mocks de models.
+ *
+ * Entradas:
+ *  - `ordemInicialVet` / `ordemInicialTec`: ordem do rodízio na criação da escala.
+ *  - `ordemMembrosVet` / `ordemMembrosTec`: ordem atual gravada nos membros (para comparar
+ *     mudança e devolver `ordemMudou*`). Quando ausente, considera-se que não houve mudança.
+ *  - `plantoesGravados`: array com `{ dataIso, categoria, vagaIndice, usuarioId }` do estado
+ *     gravado, usado para calcular `atualizados` e `diffsCongelados*`.
+ *  - `afastamentos`: lista COMPLETA de afastamentos relevantes ao período (vet + téc).
+ *  - `periodicidadeEscala`: 'fim_de_semana' | 'diario' | ... usado para decidir se datas
+ *     adicionais (feriados em dia útil) contam como "dia útil" para retornos.
+ *  - `dataCongelamentoIso`: datas estritamente anteriores ficam congeladas (não persistir).
+ */
+function recalcularEscalaCompletaNucleo({
+  ordemInicialVet = [],
+  ordemInicialTec = [],
+  ordemMembrosVet = [],
+  ordemMembrosTec = [],
+  plantoesGravados = [],
+  afastamentos = [],
+  periodicidadeEscala = 'fim_de_semana',
+  dataCongelamentoIso = null,
+}) {
+  const plantoesVetGravados = plantoesGravados.filter(
+    (p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO,
+  );
+  const plantoesTecGravados = plantoesGravados.filter(
+    (p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.TECNICO,
+  );
+  const datasPlantoesVet = [
+    ...new Set(plantoesVetGravados.map((p) => dataReferenciaParaStr(p.dataReferencia)).filter(Boolean)),
+  ].sort();
+  const datasPlantoesTec = [
+    ...new Set(plantoesTecGravados.map((p) => dataReferenciaParaStr(p.dataReferencia)).filter(Boolean)),
+  ].sort();
+
+  /**
+   * Ordenação canônica por (dataInicio, dataFim, id). O `id` é o desempate estável que garante
+   * que o resultado independe da ordem de cadastro no BD e que duas execuções consecutivas
+   * produzem o mesmo resultado.
+   */
+  const afastamentosOrdenados = [...afastamentos].sort((a, b) => {
+    const cmpIni = String(dataReferenciaParaStr(a.dataInicio)).localeCompare(
+      String(dataReferenciaParaStr(b.dataInicio)),
+    );
+    if (cmpIni !== 0) return cmpIni;
+    const cmpFim = String(dataReferenciaParaStr(a.dataFim)).localeCompare(
+      String(dataReferenciaParaStr(b.dataFim)),
+    );
+    if (cmpFim !== 0) return cmpFim;
+    return Number(a.id || 0) - Number(b.id || 0);
+  });
+
+  /**
+   * Em escalas com periodicidade "fim_de_semana", as datas adicionais (ex.: feriados em dia útil)
+   * NÃO contam como dia útil para liberar o retorno após férias/abono — o simulador já recebe
+   * esse conjunto para tratar corretamente.
+   */
+  const datasNaoUteisIsoSet =
+    String(periodicidadeEscala || '').toLowerCase() === 'fim_de_semana'
+      ? new Set(
+          plantoesGravados
+            .map((p) => dataReferenciaParaStr(p.dataReferencia))
+            .filter((ds) => !!ds && !ehFimDeSemanaDataReferencia(ds)),
+        )
+      : new Set();
+
+  const congelamentoIso =
+    dataCongelamentoIso != null && /^\d{4}-\d{2}-\d{2}$/.test(String(dataCongelamentoIso))
+      ? String(dataCongelamentoIso)
+      : dataReferenciaParaStr(new Date());
+
+  /**
+   * Filtra férias/abono que NÃO tiram plantão do titular antes de simular. Sem isso, um
+   * afastamento "irrelevante" (ex.: férias 10–17/07 de um técnico escalado só para 25/07)
+   * ainda dispararia o "retorno forçado" no primeiro plantão pós-fim e mexeria na fila.
+   * Mesma filtragem usada pelo fluxo antigo (`recalcularEscalaInterno`).
+   */
+  const categoriaPorUsuarioIdFiltro = new Map();
+  for (const id of ordemInicialVet) categoriaPorUsuarioIdFiltro.set(Number(id), CATEGORIA_PLANTAO.VETERINARIO);
+  for (const id of ordemInicialTec) categoriaPorUsuarioIdFiltro.set(Number(id), CATEGORIA_PLANTAO.TECNICO);
+  const paramsFiltroAfastamento = montarParametrosFiltroAfastamentoPlantoes({
+    plantoes: plantoesGravados,
+    ordemVetInicial: ordemInicialVet,
+    ordemTecInicial: ordemInicialTec,
+    afastamentosLista: afastamentosOrdenados,
+    periodicidadeEscala,
+    categoriaPorUsuarioId: categoriaPorUsuarioIdFiltro,
+  });
+  const afastamentosRodizio = afastamentosListaParaRodizioEscala(
+    afastamentosOrdenados,
+    paramsFiltroAfastamento,
+  );
+
+  const simVet =
+    ordemInicialVet.length > 0 && datasPlantoesVet.length > 0
+      ? simularRodizioVetPlantoes(ordemInicialVet, datasPlantoesVet, afastamentosRodizio, datasNaoUteisIsoSet)
+      : { ordemAtual: [...ordemInicialVet], idxOrdem: 0, ordemPersistida: [...ordemInicialVet], alocacoes: [] };
+
+  const plantoesTecRef = plantoesTecGravados.map((p) => ({
+    dataReferencia: dataReferenciaParaStr(p.dataReferencia),
+    categoriaPlantao: CATEGORIA_PLANTAO.TECNICO,
+    usuarioId: Number(p.usuarioId),
+    vagaIndice: Number(p.vagaIndice ?? 0),
+  }));
+  const simTec =
+    ordemInicialTec.length > 0 && datasPlantoesTec.length > 0
+      ? simularRodizioTecPlantoes(
+          ordemInicialTec,
+          datasPlantoesTec,
+          afastamentosRodizio,
+          datasNaoUteisIsoSet,
+          0,
+          plantoesTecRef,
+        )
+      : { ordemAtual: [...ordemInicialTec], idxOrdem: 0, ordemPersistida: [...ordemInicialTec], alocacoes: [] };
+
+  /**
+   * Plantões para persistir: data >= congelamento E usuário simulado difere do gravado.
+   * Datas congeladas com divergência ficam apenas registradas em `diffsCongelados*` (não persistir).
+   */
+  const updatesVet = [];
+  const diffsCongeladosVet = [];
+  for (const aloc of simVet.alocacoes) {
+    const pl = plantoesVetGravados.find(
+      (p) => dataReferenciaParaStr(p.dataReferencia) === aloc.dataIso,
+    );
+    if (!pl) continue;
+    const alvo = Number(aloc.usuarioId);
+    if (!Number.isFinite(alvo) || alvo < 1 || Number(pl.usuarioId) === alvo) continue;
+    if (aloc.dataIso < congelamentoIso) {
+      diffsCongeladosVet.push({ dataIso: aloc.dataIso, gravado: Number(pl.usuarioId), simulado: alvo });
+      continue;
+    }
+    updatesVet.push({ plantao: pl, dataIso: aloc.dataIso, usuarioId: alvo });
+  }
+
+  const updatesTec = [];
+  const diffsCongeladosTec = [];
+  for (const aloc of simTec.alocacoes) {
+    const pl = plantoesTecGravados.find(
+      (p) =>
+        dataReferenciaParaStr(p.dataReferencia) === aloc.dataIso &&
+        Number(p.vagaIndice ?? 0) === Number(aloc.vagaIndice ?? 0),
+    );
+    if (!pl) continue;
+    const alvo = Number(aloc.usuarioId);
+    if (!Number.isFinite(alvo) || alvo < 1 || Number(pl.usuarioId) === alvo) continue;
+    if (aloc.dataIso < congelamentoIso) {
+      diffsCongeladosTec.push({
+        dataIso: aloc.dataIso,
+        vagaIndice: Number(aloc.vagaIndice ?? 0),
+        gravado: Number(pl.usuarioId),
+        simulado: alvo,
+      });
+      continue;
+    }
+    updatesTec.push({
+      plantao: pl,
+      dataIso: aloc.dataIso,
+      vagaIndice: Number(aloc.vagaIndice ?? 0),
+      usuarioId: alvo,
+    });
+  }
+
+  const ordemMembrosFinalVet = simVet.ordemPersistida.length ? simVet.ordemPersistida : [...ordemMembrosVet];
+  const ordemMembrosFinalTec = simTec.ordemPersistida.length ? simTec.ordemPersistida : [...ordemMembrosTec];
+  const ordemMudouVet =
+    ordemMembrosVet.length > 0 && ordemMembrosFinalVet.join(',') !== ordemMembrosVet.join(',');
+  const ordemMudouTec =
+    ordemMembrosTec.length > 0 && ordemMembrosFinalTec.join(',') !== ordemMembrosTec.join(',');
+
+  return {
+    atualizados: updatesVet.length + updatesTec.length,
+    ordemMudou: ordemMudouVet || ordemMudouTec,
+    ordemMudouVet,
+    ordemMudouTec,
+    ordemInicialVet,
+    ordemInicialTec,
+    ordemFinalVet: ordemMembrosFinalVet,
+    ordemFinalTec: ordemMembrosFinalTec,
+    alocacoesVet: simVet.alocacoes,
+    alocacoesTec: simTec.alocacoes,
+    updatesVet,
+    updatesTec,
+    diffsCongeladosVet,
+    diffsCongeladosTec,
+    congelamentoIso,
+    afastamentosOrdenadosIds: afastamentosOrdenados.map((a) => Number(a.id || 0)),
+    afastamentosRodizioIds: afastamentosRodizio.map((a) => Number(a.id || 0)),
+  };
+}
+
+/**
+ * Recálculo total (determinístico) de uma escala a partir da ordem inicial gravada e da lista
+ * COMPLETA de afastamentos. Substitui o fluxo incremental `recalcularEscalaInterno` quando
+ * ativado: é puro o suficiente para que mesmo input produza mesmo output, e portanto:
+ *   - permite excluir qualquer afastamento (não exige LIFO);
+ *   - independe da ordem de cadastro (afastamentos são ordenados por `dataInicio, dataFim, id`);
+ *   - elimina os modos "focado", "bootstrap", "isolamento entre categorias" etc.
+ *
+ * Plantões com `dataReferencia < dataCongelamentoIso` são tratados como FATO consumado:
+ * não são persistidos diff, mesmo que a simulação difira (proteção para dias já realizados).
+ *
+ * Em `dryRun = true`, nada é gravado — útil para testes de paridade e para calcular relevância
+ * de afastamentos via diff (executar com e sem o afastamento e comparar).
+ */
+async function recalcularEscalaCompleta(
+  escalaId,
+  { transaction, dataCongelamentoIso = null, dryRun = false } = {},
+) {
+  const escala = await EscalaModel.findByPk(escalaId, { transaction });
+  if (!escala) throw new ApiBaseError('Escala não encontrada.');
+
+  const dataInicioEscalaIso = dataReferenciaParaStr(escala.dataInicio);
+  const dataFimEscalaIso = dataReferenciaParaStr(escala.dataFim);
+
+  const membros = await obterMembrosAtivosEscala(escalaId, transaction);
+  const ordemMembrosVet = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.VETERINARIO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  const ordemMembrosTec = membros
+    .filter((m) => categoriaMembroDe(m) === CATEGORIA_MEMBRO.TECNICO)
+    .map((m) => Number(m.usuarioId))
+    .filter((id) => Number.isFinite(id) && id > 0);
+
+  const ordemInicialVet = await obterOrdemCicloReferenciaEscala(
+    escalaId,
+    ordemMembrosVet,
+    CATEGORIA_MEMBRO.VETERINARIO,
+    transaction,
+  );
+  const ordemInicialTec = await obterOrdemCicloReferenciaEscala(
+    escalaId,
+    ordemMembrosTec,
+    CATEGORIA_MEMBRO.TECNICO,
+    transaction,
+  );
+
+  const plantoes = await PlantaoModel.findAll({
+    where: { escalaId },
+    order: [
+      ['dataReferencia', 'ASC'],
+      ['vagaIndice', 'ASC'],
+    ],
+    transaction,
+  });
+
+  const idsMembros = [...new Set([...ordemMembrosVet, ...ordemMembrosTec])].filter(
+    (id) => Number.isFinite(id) && id > 0,
+  );
+  const afastamentosRows = idsMembros.length
+    ? await AfastamentoModel.findAll({
+        where: {
+          usuarioId: { [Op.in]: idsMembros },
+          dataInicio: { [Op.lte]: dataFimEscalaIso },
+          dataFim: { [Op.gte]: dataInicioEscalaIso },
+        },
+        include: [{ model: TipoAfastamentoModel, as: 'tipo', attributes: ['id', 'tipo', 'regraOrdem'] }],
+        transaction,
+      })
+    : [];
+  const afastamentos = afastamentosRows.map((a) => (a.get ? a.get({ plain: true }) : a));
+
+  const resultado = recalcularEscalaCompletaNucleo({
+    ordemInicialVet,
+    ordemInicialTec,
+    ordemMembrosVet,
+    ordemMembrosTec,
+    plantoesGravados: plantoes,
+    afastamentos,
+    periodicidadeEscala: escala.periodicidade,
+    dataCongelamentoIso,
+  });
+
+  if (!dryRun) {
+    for (const u of resultado.updatesVet) {
+      const pl = u.plantao;
+      pl.usuarioId = u.usuarioId;
+      pl.observacao = null;
+      if (typeof pl.save === 'function') await pl.save({ transaction });
+    }
+    for (const u of resultado.updatesTec) {
+      const pl = u.plantao;
+      pl.usuarioId = u.usuarioId;
+      pl.observacao = null;
+      if (typeof pl.save === 'function') await pl.save({ transaction });
+    }
+    if (resultado.ordemMudouVet && ordemMembrosVet.length > 0) {
+      await atualizarOrdemMembrosEscalaSemColisao(
+        escalaId,
+        resultado.ordemFinalVet,
+        transaction,
+        CATEGORIA_MEMBRO.VETERINARIO,
+      );
+    }
+    if (resultado.ordemMudouTec && ordemMembrosTec.length > 0) {
+      await atualizarOrdemMembrosEscalaSemColisao(
+        escalaId,
+        resultado.ordemFinalTec,
+        transaction,
+        CATEGORIA_MEMBRO.TECNICO,
+      );
+    }
+  }
+
+  /** Versão "pública": omite as referências às instâncias Sequelize (`updatesVet/Tec`). */
+  return {
+    atualizados: resultado.atualizados,
+    ordemMudou: resultado.ordemMudou,
+    ordemMudouVet: resultado.ordemMudouVet,
+    ordemMudouTec: resultado.ordemMudouTec,
+    ordemInicialVet: resultado.ordemInicialVet,
+    ordemInicialTec: resultado.ordemInicialTec,
+    ordemFinalVet: resultado.ordemFinalVet,
+    ordemFinalTec: resultado.ordemFinalTec,
+    alocacoesVet: resultado.alocacoesVet,
+    alocacoesTec: resultado.alocacoesTec,
+    diffsCongeladosVet: resultado.diffsCongeladosVet,
+    diffsCongeladosTec: resultado.diffsCongeladosTec,
+    congelamentoIso: resultado.congelamentoIso,
+    afastamentosOrdenadosIds: resultado.afastamentosOrdenadosIds,
+    afastamentosRodizioIds: resultado.afastamentosRodizioIds,
+  };
+}
+
+/**
+ * (Recálculo total) Recalcula plantões e ordens das escalas em que o usuário participa e cujo
+ * período cruza [dataInicioStr, dataFimStr], usando `recalcularEscalaCompleta` (determinístico,
+ * baseado na ordem inicial gravada + lista completa de afastamentos).
+ *
+ * Substitui `recalcularEscalasPorUsuarioPeriodoInterno` para o fluxo de inclusão/exclusão de
+ * afastamento — sem necessidade de LIFO, snapshots por evento ou bootstrap especial.
+ *
+ * Auditoria: registra um evento em `EscalaAuditoriaEventoModel` por categoria que mudou.
+ * Permutas: cancela pendentes (compatível com o fluxo antigo).
+ */
+async function recalcularEscalasPorUsuarioPeriodoCompleto(
+  usuarioId,
+  dataInicioStr,
+  dataFimStr,
+  { transactionExterna = null, auditoriaContexto = null, dataCongelamentoIso = null } = {},
+) {
+  const membros = await EscalaMembroModel.findAll({
+    where: { usuarioId, ativo: true },
+    attributes: ['escalaId'],
+    transaction: transactionExterna || undefined,
+  });
+  const escalaIds = [...new Set(membros.map((m) => Number(m.escalaId)))];
+  if (escalaIds.length === 0) {
+    return {
+      escalasAfetadas: 0,
+      plantoesAtualizados: 0,
+      ordensAlteradas: 0,
+      ordemGlobalAlterada: false,
+      permutasCanceladas: 0,
+    };
+  }
+
+  const escalas = await EscalaModel.findAll({
+    where: {
+      id: { [Op.in]: escalaIds },
+      dataInicio: { [Op.lte]: dataFimStr },
+      dataFim: { [Op.gte]: dataInicioStr },
+    },
+    attributes: ['id', 'status'],
+    transaction: transactionExterna || undefined,
+  });
+
+  let plantoesAtualizados = 0;
+  let ordensAlteradas = 0;
+  let permutasCanceladas = 0;
+
+  const executar = async (transaction) => {
+    for (const esc of escalas) {
+      const ordemInicialVet = await obterOrdemCicloReferenciaEscala(
+        esc.id,
+        [],
+        CATEGORIA_MEMBRO.VETERINARIO,
+        transaction,
+      );
+      const ordemInicialTec = await obterOrdemCicloReferenciaEscala(
+        esc.id,
+        [],
+        CATEGORIA_MEMBRO.TECNICO,
+        transaction,
+      );
+
+      const recalc = await recalcularEscalaCompleta(esc.id, {
+        transaction,
+        dataCongelamentoIso,
+      });
+      plantoesAtualizados += recalc.atualizados;
+      if (recalc.ordemMudouVet) ordensAlteradas += 1;
+      if (recalc.ordemMudouTec) ordensAlteradas += 1;
+      permutasCanceladas += await cancelarPermutasPendentesEscala(esc.id, transaction);
+
+      if (auditoriaContexto) {
+        if (recalc.ordemMudouVet && ordemInicialVet.length > 0) {
+          await registrarEventoAuditoriaEscala({
+            escalaId: esc.id,
+            categoriaMembro: CATEGORIA_MEMBRO.VETERINARIO,
+            tipoEvento: auditoriaContexto.tipoEvento || 'recalculo_ordem',
+            referenciaTipo: auditoriaContexto.referenciaTipo || null,
+            referenciaId: auditoriaContexto.referenciaId || null,
+            dataReferencia: auditoriaContexto.dataReferencia || null,
+            ordemAntesUsuarioIds: recalc.ordemInicialVet,
+            ordemDepoisUsuarioIds: recalc.ordemFinalVet,
+            detalhes: auditoriaContexto.detalhes || null,
+            criadoPorUsuarioId: auditoriaContexto.criadoPorUsuarioId || null,
+            transaction,
+          });
+        }
+        if (recalc.ordemMudouTec && ordemInicialTec.length > 0) {
+          await registrarEventoAuditoriaEscala({
+            escalaId: esc.id,
+            categoriaMembro: CATEGORIA_MEMBRO.TECNICO,
+            tipoEvento: auditoriaContexto.tipoEvento || 'recalculo_ordem',
+            referenciaTipo: auditoriaContexto.referenciaTipo || null,
+            referenciaId: auditoriaContexto.referenciaId || null,
+            dataReferencia: auditoriaContexto.dataReferencia || null,
+            ordemAntesUsuarioIds: recalc.ordemInicialTec,
+            ordemDepoisUsuarioIds: recalc.ordemFinalTec,
+            detalhes: auditoriaContexto.detalhes || null,
+            criadoPorUsuarioId: auditoriaContexto.criadoPorUsuarioId || null,
+            transaction,
+          });
+        }
+      }
+    }
+  };
+
+  if (transactionExterna) {
+    await executar(transactionExterna);
+  } else {
+    await sequelizeTransaction(executar);
+  }
+
+  return {
+    escalasAfetadas: escalas.length,
+    plantoesAtualizados,
+    ordensAlteradas,
+    ordemGlobalAlterada: false,
+    permutasCanceladas,
+  };
+}
+
+/**
  * Recalcula plantões e ordens das escalas em que o usuário participa e cujo período cruza [dataInicioStr, dataFimStr].
  */
 async function recalcularEscalasPorUsuarioPeriodoInterno(
@@ -7257,7 +7733,8 @@ const EscalaService = {
   },
 
   /**
-   * Restaura ordem na escala e ordem geral a partir dos snapshots, remove o afastamento e recalcula as escalas.
+   * Remove o afastamento e recalcula as escalas via `recalcularEscalaCompleta` (determinístico,
+   * baseado na ordem inicial gravada). Permite excluir QUALQUER afastamento — não exige LIFO.
    */
   desfazerAfastamentoRecalculo: async (afastamentoPlain, transaction, criadoPorUsuarioId = null) => {
     const id = Number(afastamentoPlain.id);
@@ -7272,21 +7749,10 @@ const EscalaService = {
     const escopoAf = await escopoOrdemGlobalParaUsuarioId(usuarioId, transaction);
     const categoriaAlvo = escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO;
 
-    if (!(await afastamentoEhMaisRecenteDaClasse(afastamentoPlain, transaction))) {
-      const rotulo = escopoAf === ESCOPO_ORDEM.TECNICO ? 'técnicos' : 'veterinários';
-      throw new ApiBaseError(
-        `Só é possível desfazer o afastamento mais recente da classe (${rotulo}), pelo cadastro mais novo no sistema.`,
-      );
-    }
-
-    await restaurarEstadoAntesAfastamento(afastamentoPlain, transaction);
-
     await AfastamentoModel.destroy({ where: { id }, transaction });
 
-    return await recalcularEscalasPorUsuarioPeriodoInterno(usuarioId, dataInicioStr, dataFimStr, {
+    return await recalcularEscalasPorUsuarioPeriodoCompleto(usuarioId, dataInicioStr, dataFimStr, {
       transactionExterna: transaction,
-      historicoMotivo: 'manual',
-      historicoAfastamento: null,
       auditoriaContexto: {
         tipoEvento: 'afastamento_exclusao',
         referenciaTipo: 'afastamento',
@@ -7304,11 +7770,18 @@ const EscalaService = {
           },
         },
         criadoPorUsuarioId,
-        registrarMesmoSemMudanca: true,
         categoriaAlvo,
       },
     });
   },
+
+  /**
+   * (Fase 1 — recálculo total) Recalcula plantões e ordem da escala a partir da ordem inicial
+   * gravada (`motivo='inicial'`) e da lista COMPLETA de afastamentos. Ainda não está integrada
+   * ao fluxo de cadastro/exclusão de afastamentos; é chamada apenas em testes/depuração.
+   */
+  recalcularEscalaCompleta: async (escalaId, options = {}) =>
+    recalcularEscalaCompleta(escalaId, options),
 
   recalcularEscalasPorAfastamento: async (afastamentoId, options = {}) => {
     const transactionExterna = options.transaction || null;
@@ -7320,42 +7793,30 @@ const EscalaService = {
     if (!afastamento) throw new ApiBaseError('Afastamento não encontrado para recálculo.');
 
     const escopoAf = await escopoOrdemGlobalParaUsuarioId(afastamento.usuarioId, transactionExterna || undefined);
-    const ordemGlobalAntesSnapshot = await obterOrdemGlobalUsuarioIds(transactionExterna || undefined, escopoAf);
 
     const dataInicioStr = dataReferenciaParaStr(afastamento.dataInicio);
     const dataFimStr = dataReferenciaParaStr(afastamento.dataFim);
-    const afPlain = afastamento.get ? afastamento.get({ plain: true }) : afastamento;
-    let dataInicioRecalc = dataInicioStr;
-    if (afastamentoEhFerias(afPlain) || afastamentoEhAbono(afPlain)) {
-      const retroInicio = calcularDataInicioRetroCadastro(dataInicioStr, new Set());
-      if (retroInicio < dataInicioRecalc) dataInicioRecalc = retroInicio;
-    }
-    const resultado = await recalcularEscalasPorUsuarioPeriodoInterno(afastamento.usuarioId, dataInicioRecalc, dataFimStr, {
-      transactionExterna,
-      historicoMotivo: 'afastamento',
-      historicoAfastamento: afastamento,
-      auditoriaContexto: {
-        tipoEvento: 'afastamento_inclusao',
-        referenciaTipo: 'afastamento',
-        referenciaId: Number(afastamento.id),
-        detalhes: {
-          dataInicio: dataInicioStr,
-          dataFim: dataFimStr,
-          usuarioId: Number(afastamento.usuarioId),
-          tipoAfastamento: afastamento?.tipo?.tipo || null,
+    const resultado = await recalcularEscalasPorUsuarioPeriodoCompleto(
+      afastamento.usuarioId,
+      dataInicioStr,
+      dataFimStr,
+      {
+        transactionExterna,
+        auditoriaContexto: {
+          tipoEvento: 'afastamento_inclusao',
+          referenciaTipo: 'afastamento',
+          referenciaId: Number(afastamento.id),
+          detalhes: {
+            dataInicio: dataInicioStr,
+            dataFim: dataFimStr,
+            usuarioId: Number(afastamento.usuarioId),
+            tipoAfastamento: afastamento?.tipo?.tipo || null,
+          },
+          criadoPorUsuarioId,
+          categoriaAlvo: escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO,
         },
-        criadoPorUsuarioId,
-        categoriaAlvo: escopoAf === ESCOPO_ORDEM.TECNICO ? CATEGORIA_MEMBRO.TECNICO : CATEGORIA_MEMBRO.VETERINARIO,
       },
-    });
-
-    /** Sempre persiste o snapshot "antes do recálculo" (usado no bootstrap ao desfazer outro afastamento). */
-    if (transactionExterna) {
-      await AfastamentoModel.update(
-        { ordemGlobalUsuarioIdsAntes: ordemGlobalAntesSnapshot },
-        { where: { id: afastamentoId }, transaction: transactionExterna },
-      );
-    }
+    );
 
     return {
       afastamentoId: Number(afastamento.id),
@@ -7784,6 +8245,8 @@ EscalaService.__testables = {
   afastamentoFeriasOuAbonoContribuiCalendarioNoPeriodoRetro,
   classificarRelevanciaAfastamentoEscalaAtiva,
   enriquecerRelevanciaEscalaAtivaAfastamentos,
+  recalcularEscalaCompleta,
+  recalcularEscalaCompletaNucleo,
 };
 
 module.exports = EscalaService;

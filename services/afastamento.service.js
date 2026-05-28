@@ -36,15 +36,17 @@ const AfastamentoService = {
         ['id', 'DESC'],
       ],
     });
-    const { veterinario: idVet, tecnico: idTec } = await EscalaService.obterIdsAfastamentosMaisRecentesPorClasse();
-    const idsDesfazer = new Set(
-      [idVet, idTec].filter((x) => Number.isFinite(Number(x)) && Number(x) > 0).map(Number),
-    );
+    /**
+     * (Recálculo total) Qualquer afastamento pode ser desfeito — não é mais necessário aplicar
+     * regra LIFO. A permissão por usuário continua: admin pode desfazer qualquer um, e usuário
+     * comum só os próprios. O recálculo da escala é refeito do zero a partir da ordem inicial
+     * gravada + lista atual de afastamentos.
+     */
     const lista = rows.map((r) => {
       const plain = r.get({ plain: true });
       return {
         ...plain,
-        desfazerDisponivel: idsDesfazer.has(Number(plain.id)),
+        desfazerDisponivel: admin || Number(plain.usuarioId) === Number(usuarioIdLogado),
       };
     });
     if (admin) {
