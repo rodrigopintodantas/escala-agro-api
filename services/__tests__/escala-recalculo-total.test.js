@@ -414,6 +414,127 @@ describe('recalcularEscalaCompletaNucleo (Fase 1 — núcleo puro)', () => {
     expect(comFerias.afastamentosRodizioIds).toEqual([]);
   });
 
+  test('abono téc 12/06 (sex) deve ser IRRELEVANTE quando Marilene já está em 20/06 (deslocada por abono 15/06)', () => {
+    /**
+     * Cenário reportado: depois de cadastrar Maria férias 08/06–02/07 e abono Marilene 15/06,
+     * Marilene está em 20/06 v0 (retorno forçado). Adicionar abono Marilene 12/06 deveria ser
+     * IRRELEVANTE — ela não plantonea nem em 13/06 (Marcelo está lá) nem em 14/06 (Walber), e
+     * 20/06 já passou por dia útil intermediário (16-19/06).
+     */
+    const TEC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+    const mariaId = TEC[7];
+    const marileneId = TEC[8];
+    const datasTec = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const afMaria = {
+      id: 1, usuarioId: mariaId, tipo: { tipo: 'Férias' },
+      dataInicio: '2026-06-08', dataFim: '2026-07-02',
+    };
+    const afAbonoMarilene15 = {
+      id: 2, usuarioId: marileneId, tipo: { tipo: 'Abono' },
+      dataInicio: '2026-06-15', dataFim: '2026-06-15',
+    };
+    const afAbonoMarilene12 = {
+      id: 3, usuarioId: marileneId, tipo: { tipo: 'Abono' },
+      dataInicio: '2026-06-12', dataFim: '2026-06-12',
+    };
+
+    /** Calendário gravado = recálculo com Maria + abono Marilene 15/06. */
+    const baseSem12 = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: plantoesTecGravados(datasTec, TEC),
+      afastamentos: [afMaria, afAbonoMarilene15],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+    const gravados = baseSem12.alocacoesTec.map((a) => ({
+      dataReferencia: a.dataIso, categoriaPlantao: 'tecnico',
+      usuarioId: a.usuarioId, vagaIndice: a.vagaIndice,
+    }));
+    /** Confirma a premissa do cenário: Marilene em 20/06, fora de 13/06 e 14/06. */
+    expect(baseSem12.alocacoesTec.find((a) => a.dataIso === '2026-06-20' && a.vagaIndice === 0)?.usuarioId).toBe(marileneId);
+    expect(baseSem12.alocacoesTec.find((a) => a.dataIso === '2026-06-14' && a.vagaIndice === 1)?.usuarioId).not.toBe(marileneId);
+
+    /** Adicionar abono 12/06: recálculo total não deve alterar nada, e o abono deve ser filtrado. */
+    const comAbono12 = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: gravados,
+      afastamentos: [afMaria, afAbonoMarilene15, afAbonoMarilene12],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+    expect(comAbono12.atualizados).toBe(0);
+    expect(comAbono12.afastamentosRodizioIds).not.toContain(3);
+    /** Tag também deve vir irrelevante. */
+    const categoriaPorUsuarioId = new Map();
+    for (const id of TEC) categoriaPorUsuarioId.set(Number(id), 'tecnico');
+    const paramsFiltro = montarParametrosFiltroAfastamentoPlantoes({
+      plantoes: gravados, ordemVetInicial: [], ordemTecInicial: TEC,
+      afastamentosLista: [afMaria, afAbonoMarilene15, afAbonoMarilene12],
+      periodicidadeEscala: 'fim_de_semana', categoriaPorUsuarioId,
+    });
+    const ctx = {
+      escalaId: 1, escalaNome: 'Teste', escalaStatus: 'ativa',
+      dataInicioStr: '2026-06-06', dataFimStr: '2026-07-26', paramsFiltro,
+    };
+    expect(classificarRelevanciaAfastamentoEscalaAtiva(afAbonoMarilene12, ctx)).toBe('irrelevante');
+  });
+
+  test('retro-cadastro também bloqueia candidato substituto: abono téc em 2ª-feira tira titular do plantão de domingo anterior', () => {
+    /**
+     * Regressão real (cenário produção, 22 técnicos, ordem oficial):
+     * - Maria Claudinéia (idx 7) tem férias 08/06–02/07, então em 14/06 v1 o substituto natural
+     *   passa a ser Marilene (idx 8).
+     * - Marilene tem abono em 15/06 (2ª-feira). Como não há dia útil entre o domingo 14/06 e a
+     *   2ª-feira do abono, o retro-cadastro impede Marilene de plantonear em 14/06.
+     *
+     * Bug: a busca por substituto não verificava retro-cadastro, então o simulador escolhia
+     * Marilene como substituta e ela ficava em 14/06 v1 mesmo com o abono em 15/06.
+     */
+    const TEC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+    const mariaId = TEC[7];
+    const marileneId = TEC[8];
+    const datasTec = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const plantoesTec = plantoesTecGravados(datasTec, TEC);
+    const afMaria = {
+      id: 1,
+      usuarioId: mariaId,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-06-08',
+      dataFim: '2026-07-02',
+    };
+    const afMarilene = {
+      id: 2,
+      usuarioId: marileneId,
+      tipo: { tipo: 'Abono' },
+      dataInicio: '2026-06-15',
+      dataFim: '2026-06-15',
+    };
+
+    const r = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: plantoesTec,
+      afastamentos: [afMaria, afMarilene],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+
+    const alocacao14v1 = r.alocacoesTec.find((a) => a.dataIso === '2026-06-14' && a.vagaIndice === 1);
+    expect(alocacao14v1?.usuarioId).not.toBe(marileneId);
+  });
+
   test('tag de relevância acompanha o recálculo total: férias téc Hugo 10–17/07 é IRRELEVANTE', () => {
     /**
      * Regressão (Diego/Hugo): o classificador da tag usava simulação sem filtrar afastamentos

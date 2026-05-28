@@ -2599,17 +2599,64 @@ function afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(af, params) {
   return false;
 }
 
+/**
+ * Filtragem ITERATIVA dos férias/abono "sem efeito real" para o rodízio.
+ *
+ * Por que iterativa? A heurística `afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao` decide se um
+ * afastamento X é irrelevante comparando o calendário gravado/`sem-X` contra um cenário em que
+ * o titular fica bloqueado. Quando o usuário tem dois afastamentos que "se cobrem mutuamente"
+ * (ex.: abono Marilene 12/06 + abono Marilene 15/06, ambos disparam retorno forçado em 20/06),
+ * cada um isoladamente parece redundante — o outro mantém o titular fora dos plantões. Avaliando
+ * cada um contra TODOS os outros, ambos seriam removidos e o titular voltaria ao plantão original,
+ * quebrando o calendário gravado.
+ *
+ * Solução: percorre os afastamentos em ordem canônica (`dataInicio, dataFim, id`) e tenta remover
+ * um por vez, sempre recalculando o conjunto `efetivos`. Se a remoção de X (com os efetivos
+ * atualizados) for segura — titular permanece coberto em todos os plantões — X é removido. Se não,
+ * mantém. Repete até estabilizar (ponto fixo). É monotônico (só remove), termina em O(N²) no pior caso.
+ *
+ * Não usar `Redundante` aqui: afastamentos já refletidos no calendário gravado ainda precisam entrar
+ * na re-simulação plena para reproduzir o mesmo calendário; caso contrário a simulação roda sem eles
+ * e sobrescreve com a ordem alfabética.
+ */
 function afastamentosListaParaRodizioEscala(afastamentos, paramsFiltro) {
-  return (afastamentos || []).filter((row) => {
-    const plain = row.get ? row.get({ plain: true }) : row;
-    if (!afastamentoEhFerias(plain) && !afastamentoEhAbono(plain)) return true;
-    /**
-     * Filtro do rodízio: removemos apenas o afastamento sem efeito real (titular não perde plantão).
-     * Não usar `Redundante` aqui — afastamentos já refletidos no calendário gravado ainda precisam
-     * entrar na re-simulação plena (sincronizarCalendarioRodizioPlenoEscalaBimestre) para reproduzir
-     * o mesmo calendário; caso contrário a simulação roda sem eles e sobrescreve com a ordem alfabética.
-     */
-    return afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(plain, paramsFiltro);
+  const lista = (afastamentos || []).map((row) => (row.get ? row.get({ plain: true }) : row));
+  const naoFiltraveis = lista.filter((p) => !afastamentoEhFerias(p) && !afastamentoEhAbono(p));
+  const candidatos = lista.filter((p) => afastamentoEhFerias(p) || afastamentoEhAbono(p));
+
+  candidatos.sort((a, b) => {
+    const ai = String(dataReferenciaParaStr(a.dataInicio) || '');
+    const bi = String(dataReferenciaParaStr(b.dataInicio) || '');
+    if (ai !== bi) return ai.localeCompare(bi);
+    const af = String(dataReferenciaParaStr(a.dataFim) || '');
+    const bf = String(dataReferenciaParaStr(b.dataFim) || '');
+    if (af !== bf) return af.localeCompare(bf);
+    return Number(a.id || 0) - Number(b.id || 0);
+  });
+
+  let efetivos = [...candidatos];
+  let removeuAlgumNestaPassada = true;
+  while (removeuAlgumNestaPassada) {
+    removeuAlgumNestaPassada = false;
+    for (const candidato of [...efetivos]) {
+      const paramsAtualizados = {
+        ...paramsFiltro,
+        afastamentosLista: [...naoFiltraveis, ...efetivos],
+      };
+      if (!afastamentoFeriasOuAbonoTitularPerdeAlgumPlantao(candidato, paramsAtualizados)) {
+        efetivos = efetivos.filter((x) => x !== candidato);
+        removeuAlgumNestaPassada = true;
+      }
+    }
+  }
+
+  /**
+   * Preserva a ordem ORIGINAL para os mantidos (estabilidade do retorno em relação à entrada).
+   */
+  const efetivosSet = new Set(efetivos);
+  return lista.filter((p) => {
+    if (!afastamentoEhFerias(p) && !afastamentoEhAbono(p)) return true;
+    return efetivosSet.has(p);
   });
 }
 
@@ -3054,12 +3101,26 @@ function simularRodizioVetPlantoes(ordemInicial, datasPlantaoIso, afastamentosFl
             dataIso,
             datasNaoUteisIsoSet,
           );
+          /**
+           * Retro-cadastro também precisa ser verificado no substituto. Ex.: candidato tem abono
+           * na 2ª-feira e o plantão é no domingo anterior; sem dia útil intermediário, ele estaria
+           * impedido de plantonear no domingo. Antes essa regra só era aplicada ao preferencial.
+           */
+          const candidatoBloqueadoRetroCadastro = usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+            afastamentosPorUsuario,
+            candidato,
+            dataIso,
+            datasNaoUteisIsoSet,
+          );
           const candidatoSomenteAtestado =
             !candidatoBloqueadoPosFeriasOuAbono &&
+            !candidatoBloqueadoRetroCadastro &&
             afastamentosCandidato.length > 0 &&
             afastamentosCandidato.every((af) => afastamentoEhAtestado(af));
           const candidatoIndisponivelReal =
-            candidatoBloqueadoPosFeriasOuAbono || (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
+            candidatoBloqueadoPosFeriasOuAbono ||
+            candidatoBloqueadoRetroCadastro ||
+            (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
           if (candidatoIndisponivelReal) continue;
           encontrado = candidato;
           break;
@@ -3222,12 +3283,26 @@ function simularRodizioTecPlantoes(
           dataIso,
           datasNaoUteisIsoSet,
         );
+        /**
+         * Retro-cadastro também precisa ser verificado no substituto. Ex.: candidato tem abono
+         * na 2ª-feira e o plantão é no domingo anterior; sem dia útil intermediário, ele estaria
+         * impedido de plantonear no domingo. Antes essa regra só era aplicada ao preferencial.
+         */
+        const candidatoBloqueadoRetroCadastro = usuarioBloqueadoRetroCadastroFeriasAbonoNoDia(
+          afastamentosPorUsuario,
+          candidato,
+          dataIso,
+          datasNaoUteisIsoSet,
+        );
         const candidatoSomenteAtestado =
           !candidatoBloqueadoPosFeriasOuAbono &&
+          !candidatoBloqueadoRetroCadastro &&
           afastamentosCandidato.length > 0 &&
           afastamentosCandidato.every((af) => afastamentoEhAtestado(af));
         const candidatoIndisponivelReal =
-          candidatoBloqueadoPosFeriasOuAbono || (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
+          candidatoBloqueadoPosFeriasOuAbono ||
+          candidatoBloqueadoRetroCadastro ||
+          (afastamentosCandidato.length > 0 && !candidatoSomenteAtestado);
         if (candidatoIndisponivelReal) continue;
         encontrado = candidato;
         break;

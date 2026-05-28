@@ -32,30 +32,34 @@ const veterinarios = [
   servidor('Cosme Nogueira Da Silva', 'cosme_nogueira', 'Veterinário', 'Veterinário'),
 ];
 
-/** Técnicos — ordem de cadastro conforme lista oficial. */
+/**
+ * Técnicos — ordem inicial oficial usada na criação da escala (ordem global de produção).
+ * Essa sequência é a referência canônica consumida por `reconstruirOrdemServidorInicial`
+ * para popular `ordem_servidor` em "Carga produção" e "Reiniciar Teste".
+ */
 const tecnicos = [
-  servidor('Adaílton Soares Guimarães', 'adailton_soares', 'Técnico', 'Técnico'),
-  servidor('Amâncio Rufino De Mello', 'amancio_rufino', 'Técnico', 'Técnico'),
   servidor('Carlos Vinicius Dos Santos Oliveira', 'carlos_vinicius', 'Técnico', 'Técnico'),
   servidor('Claudemar Jorge Fereira', 'claudemar_jorge', 'Técnico', 'Técnico'),
   servidor('Douglas Barbosa Lucas', 'douglas_barbosa', 'Técnico', 'Técnico'),
   servidor('Fabrícia Vieira Dos Santos Galeno', 'fabricia_vieira', 'Técnico', 'Técnico'),
-  servidor('Félix Da Silva Santarém', 'felix_santarem', 'Técnico', 'Técnico'),
   servidor('Francisco Macilon Dantas', 'francisco_macilon', 'Técnico', 'Técnico'),
-  servidor('Gabriel De Oliveira Ferreira', 'gabriel_oliveira', 'Técnico', 'Técnico'),
-  servidor('Jefferson Lemos Moreira Alves', 'jefferson_lemos', 'Técnico', 'Técnico'),
-  servidor('João Victor Teles Da Silva', 'joao_victor_teles', 'Técnico', 'Técnico'),
-  servidor('Jose Barros De Morais', 'jose_barros', 'Técnico', 'Técnico'),
-  servidor('Márbylla Souza Bezerra Ramalho', 'marbylla_souza', 'Técnico', 'Técnico'),
   servidor('Marcelo Antonio Alves Da Rocha', 'marcelo_antonia_rocha', 'Técnico', 'Técnico'),
   servidor('Marcondes Ribeiro Palmeira', 'marcondes_ribeiro', 'Técnico', 'Técnico'),
   servidor('Maria Claudinéia De Rezende', 'maria_claudineia', 'Técnico', 'Técnico'),
   servidor('Marilene De S. C. Lopes Da Silva', 'marilene_lopes', 'Técnico', 'Técnico'),
-  servidor('Paulo Sérgio Cavalcante Fernandes', 'paulo_sergio', 'Técnico', 'Técnico'),
-  servidor('Rosemar Dos Santos', 'rosemar_santos', 'Técnico', 'Técnico'),
-  servidor('Valdecy Rodrigues', 'valdecy_rodrigues', 'Técnico', 'Técnico'),
-  servidor('Victor Afonso Gomes', 'victor_afonso', 'Técnico', 'Técnico'),
   servidor('Walber Ferreira De Oliveira', 'walber_ferreira', 'Técnico', 'Técnico'),
+  servidor('Félix Da Silva Santarém', 'felix_santarem', 'Técnico', 'Técnico'),
+  servidor('Rosemar Dos Santos', 'rosemar_santos', 'Técnico', 'Técnico'),
+  servidor('Adaílton Soares Guimarães', 'adailton_soares', 'Técnico', 'Técnico'),
+  servidor('Victor Afonso Gomes', 'victor_afonso', 'Técnico', 'Técnico'),
+  servidor('Jefferson Lemos Moreira Alves', 'jefferson_lemos', 'Técnico', 'Técnico'),
+  servidor('João Victor Teles Da Silva', 'joao_victor_teles', 'Técnico', 'Técnico'),
+  servidor('Márbylla Souza Bezerra Ramalho', 'marbylla_souza', 'Técnico', 'Técnico'),
+  servidor('Amâncio Rufino De Mello', 'amancio_rufino', 'Técnico', 'Técnico'),
+  servidor('Paulo Sérgio Cavalcante Fernandes', 'paulo_sergio', 'Técnico', 'Técnico'),
+  servidor('Jose Barros De Morais', 'jose_barros', 'Técnico', 'Técnico'),
+  servidor('Gabriel De Oliveira Ferreira', 'gabriel_oliveira', 'Técnico', 'Técnico'),
+  servidor('Valdecy Rodrigues', 'valdecy_rodrigues', 'Técnico', 'Técnico'),
 ];
 
 function listarTodos() {
