@@ -4886,16 +4886,29 @@ async function recalcularEscalaInterno(
       .sort();
     const primeiraDataRelevante = datasRelevantes[0];
     if (primeiraDataRelevante) {
+      /**
+       * Isolamento entre categorias: a sincronização de `idxOrdem` deve atualizar apenas o
+       * índice da categoria do titular focado. Se o focado é técnico (ex.: férias do Fábio),
+       * sincronizar `idxOrdemVet` aqui faria a rotação final (logo abaixo do loop principal)
+       * embaralhar a ordem vet sem que nenhum plantão vet tenha sido reprocessado.
+       */
+      const focadoEhVet = ordemAtualDbInicialVet.includes(Number(usuarioAfetadoRecalculoId));
+      const focadoEhTec = ordemAtualDbInicialTec.includes(Number(usuarioAfetadoRecalculoId));
+      const semCategoriaFocada = !focadoEhVet && !focadoEhTec;
       const idxSync = sincronizarIdxOrdemDePlantoes(
         plantoes,
-        ordemAtualVet,
-        ordemAtualTec,
+        focadoEhVet || semCategoriaFocada ? ordemAtualVet : [],
+        focadoEhTec || semCategoriaFocada ? ordemAtualTec : [],
         primeiraDataRelevante,
       );
-      idxOrdemVet = idxSync.idxVet;
-      idxOrdemTec = idxSync.idxTec;
-      idxState.idxVet = idxOrdemVet;
-      idxState.idxTec = idxOrdemTec;
+      if (focadoEhVet || semCategoriaFocada) {
+        idxOrdemVet = idxSync.idxVet;
+        idxState.idxVet = idxOrdemVet;
+      }
+      if (focadoEhTec || semCategoriaFocada) {
+        idxOrdemTec = idxSync.idxTec;
+        idxState.idxTec = idxOrdemTec;
+      }
     }
   }
   let atualizados = 0;
@@ -4950,15 +4963,16 @@ async function recalcularEscalaInterno(
   }
 
   /**
-   * Isolamento entre categorias no fluxo "geral" (sem modo focado): quando o afastamento
-   * focado é claramente de uma categoria (vet ou téc) e há outros afastamentos prévios na
-   * escala, plantões da OUTRA categoria não devem ser reprocessados — a fila gravada nos
-   * membros pode estar desalinhada com o calendário gravado por sincronizações prévias em
-   * modo focado, e re-simular vet a partir dessa fila + idx=0 produz calendário fora do
-   * que está gravado, atribuindo o titular a datas onde ele tem abono cadastrado.
+   * Isolamento entre categorias: quando o afastamento focado pertence claramente a uma
+   * categoria (vet xor téc), plantões da OUTRA categoria não devem ser reprocessados.
+   * Vale tanto para o fluxo "geral" (a fila gravada nos membros pode estar desalinhada
+   * com o calendário por sincronizações prévias e re-simular gera datas erradas), quanto
+   * para o modo focado (loop principal poderia avançar `idxOrdem` da categoria oposta e
+   * a rotação final pós-loop embaralharia a ordem dela sem motivo — ex.: férias téc do
+   * Fábio rotacionando indevidamente a ordem dos veterinários).
    */
   const usuarioIdFocadoIsolamento =
-    historicoMotivo === 'afastamento' && historicoAfastamento && !modoRecalculoFocado
+    historicoMotivo === 'afastamento' && historicoAfastamento
       ? Number(
           (historicoAfastamento.get && historicoAfastamento.get({ plain: true })?.usuarioId) ??
             historicoAfastamento.usuarioId,
@@ -4971,7 +4985,7 @@ async function recalcularEscalaInterno(
     Number.isFinite(usuarioIdFocadoIsolamento) &&
     ordemAtualDbInicialTec.includes(usuarioIdFocadoIsolamento);
   const isolarCategoriaOposta =
-    !modoRecalculoFocado && (afastamentoFocadoEhVet !== afastamentoFocadoEhTec);
+    afastamentoFocadoEhVet !== afastamentoFocadoEhTec;
   const categoriaPreservadaIsolamento = isolarCategoriaOposta
     ? (afastamentoFocadoEhTec ? CATEGORIA_PLANTAO.VETERINARIO : CATEGORIA_PLANTAO.TECNICO)
     : null;

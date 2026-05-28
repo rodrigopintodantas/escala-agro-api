@@ -1175,4 +1175,77 @@ describe('Férias/abono sem efeito nos plantões do titular', () => {
     const filtrados = afastamentosListaParaRodizioEscala(todos, p);
     expect(filtrados.map((a) => Number(a.id)).sort()).toEqual([1, 2, 3, 4, 5]);
   });
+
+  /**
+   * Regressão (isolamento da sincronização de idx no modo focado):
+   * Em `recalcularEscalaInterno`, quando o afastamento focado é técnico (ex.: férias do Fábio
+   * 17-24/06), `sincronizarIdxOrdemDePlantoes` deve ser chamada com `ordemVet=[]` para que o
+   * `idxVet` retornado seja 0. Caso contrário, a rotação final pós-loop (`ordemAtualVet =
+   * rotacionarOrdemParaProximoPreferencial(ordemAtualVet, idxOrdemVet)`) embaralha a ordem
+   * dos veterinários sem que nenhum plantão vet tenha sido reprocessado.
+   */
+  test('sincronizarIdxOrdemDePlantoes com ordemVet=[] mantém idxVet=0 (isolamento focado téc)', () => {
+    const { sincronizarIdxOrdemDePlantoes } = EscalaService.__testables;
+    const ORDEM_VET_BCEFDHAG = [102, 103, 105, 106, 104, 108, 101, 107];
+    const ORDEM_TEC = [201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212];
+    const plantoes = [
+      { dataReferencia: '2026-06-06', categoriaPlantao: 'veterinario', usuarioId: 102 },
+      { dataReferencia: '2026-06-06', categoriaPlantao: 'tecnico', usuarioId: 201, vagaIndice: 0 },
+      { dataReferencia: '2026-06-13', categoriaPlantao: 'veterinario', usuarioId: 103 },
+      { dataReferencia: '2026-06-13', categoriaPlantao: 'tecnico', usuarioId: 203, vagaIndice: 0 },
+    ];
+    const idxAmbos = sincronizarIdxOrdemDePlantoes(plantoes, ORDEM_VET_BCEFDHAG, ORDEM_TEC, '2026-06-21');
+    expect(idxAmbos.idxVet).not.toBe(0);
+    const idxSoTec = sincronizarIdxOrdemDePlantoes(plantoes, [], ORDEM_TEC, '2026-06-21');
+    expect(idxSoTec.idxVet).toBe(0);
+    expect(idxSoTec.idxTec).toBe(idxAmbos.idxTec);
+  });
+
+  /**
+   * Regressão (férias téc Fábio não altera calendário vet):
+   * Após escala jun+jul ABCDEFGH com Ana(férias 05-19/06)+Diego(abono 12/06)+Gabriela(férias 17-24/06)
+   * +Ana(abono 17/07)+Henrique(abono 17/07), o calendário vet gravado é BCEFDHAG/BCEFDGAH.
+   * Cadastrar férias técnico Fábio 17-24/06 não pode alterar a simulação plena vet — passando
+   * todos os afastamentos (vet+téc), a simulação ignora o titular téc (fora da `ordemVet`) e
+   * o resultado vet permanece exatamente BCEFDHAG/BCEFDGAH.
+   */
+  test('férias téc Fábio 17–24/06 não altera simulação plena vet (BCEFDHAG/BCEFDGAH)', () => {
+    const ORDEM_VET = ORDEM;
+    const DATAS = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const LETRA = { 101: 'A', 102: 'B', 103: 'C', 104: 'D', 105: 'E', 106: 'F', 107: 'G', 108: 'H' };
+    const seq = (alocacoes) =>
+      DATAS.map((d) => {
+        const a = alocacoes.find((x) => x.dataIso === d);
+        return a ? LETRA[a.usuarioId] : '?';
+      }).join('');
+
+    const FABIO_TEC = 211;
+    const afAna = { id: 1, usuarioId: 101, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-05', dataFim: '2026-06-19' };
+    const afDiego = { id: 2, usuarioId: 104, tipo: { tipo: 'Abono' }, dataInicio: '2026-06-12', dataFim: '2026-06-12' };
+    const afGab = { id: 3, usuarioId: 107, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-17', dataFim: '2026-06-24' };
+    const afAna17jul = { id: 4, usuarioId: 101, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-17', dataFim: '2026-07-17' };
+    const afHen17jul = { id: 5, usuarioId: 108, tipo: { tipo: 'Abono' }, dataInicio: '2026-07-17', dataFim: '2026-07-17' };
+    const afFabio = { id: 6, usuarioId: FABIO_TEC, tipo: { tipo: 'Férias' }, dataInicio: '2026-06-17', dataFim: '2026-06-24' };
+
+    const semFabio = simularRodizioVetPlantoes(
+      ORDEM_VET,
+      DATAS,
+      [afAna, afDiego, afGab, afAna17jul, afHen17jul],
+      new Set(),
+    );
+    expect(seq(semFabio.alocacoes)).toBe('BCEFDHAGBCEFDGAH');
+
+    const comFabio = simularRodizioVetPlantoes(
+      ORDEM_VET,
+      DATAS,
+      [afAna, afDiego, afGab, afAna17jul, afHen17jul, afFabio],
+      new Set(),
+    );
+    expect(seq(comFabio.alocacoes)).toBe(seq(semFabio.alocacoes));
+  });
 });
