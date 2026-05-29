@@ -937,6 +937,155 @@ function montarRetornosFeriasNoPrimeiroPlantao(
   return mapa;
 }
 
+/**
+ * Gera datas hipotéticas de plantão APÓS o fim da escala, replicando o padrão de intervalos
+ * das últimas datas (ciclo detectado automaticamente). Em escala de fim de semana o ciclo é
+ * `[6, 1, 6, 1, ...]`, então as próximas datas após `26/07-dom` são `01/08-sáb`, `02/08-dom`,
+ * `08/08-sáb`, `09/08-dom`, `15/08-sáb`, etc. Em escala diária `[1, 1, ...]` é `+1, +1, ...`.
+ * Fallback: incrementos de 7 dias.
+ */
+function gerarDatasPlantaoHipoteticas(datasPlantaoIso, n) {
+  if (!Array.isArray(datasPlantaoIso) || datasPlantaoIso.length === 0) return [];
+  const datas = [...datasPlantaoIso].sort();
+  const numDatas = datas.length;
+  const baseLen = Math.min(numDatas - 1, 8);
+  const intervalos = [];
+  for (let i = numDatas - baseLen; i < numDatas; i++) {
+    if (i <= 0) continue;
+    const a = new Date(`${datas[i - 1]}T12:00:00`);
+    const b = new Date(`${datas[i]}T12:00:00`);
+    const diff = Math.round((b - a) / 86400000);
+    if (Number.isFinite(diff) && diff > 0) intervalos.push(diff);
+  }
+  if (intervalos.length === 0) intervalos.push(7);
+
+  let cycleLen = intervalos.length;
+  for (let k = 1; k <= Math.floor(intervalos.length / 2); k++) {
+    let isCycle = true;
+    for (let i = 0; i + k < intervalos.length; i++) {
+      if (intervalos[i] !== intervalos[i + k]) {
+        isCycle = false;
+        break;
+      }
+    }
+    if (isCycle) {
+      cycleLen = k;
+      break;
+    }
+  }
+
+  const fantasmas = [];
+  let dataAtual = datas[numDatas - 1];
+  let idxCiclo = intervalos.length % cycleLen;
+  for (let i = 0; i < n; i++) {
+    const intervalo = intervalos[idxCiclo % intervalos.length] || 7;
+    if (intervalo <= 0) break;
+    dataAtual = adicionarDiasIso(dataAtual, intervalo);
+    fantasmas.push(dataAtual);
+    idxCiclo = (idxCiclo + 1) % cycleLen;
+  }
+  return fantasmas;
+}
+
+/**
+ * Reposiciona, na fila final do rodízio, usuários cujo afastamento (férias/abono) terminou
+ * sem que houvesse plantão na escala em que o "retorno forçado" pudesse acontecer. A fila
+ * final passa a refletir o estado em que o rodízio TERMINARIA caso a escala continuasse
+ * gerando plantões hipotéticos com o mesmo padrão de intervalos das últimas datas.
+ *
+ * Posicionamento: cada pendente é colocado em uma posição relativa ao próximo preferencial
+ * (`idxOrdem`) igual ao número de "vagas hipotéticas" que ele PULARIA antes de retornar.
+ *  - Fabrícia (férias 20–29/07): retorna em 01/08 (1ª data hipotética). Pula 0 vagas.
+ *    Posição relativa = 0 → vai para o topo da fila persistida.
+ *  - Helena (férias 24/07–07/08): retorna em 15/08 (5ª data). Pula 8 vagas (1, 2, 8, 9 de
+ *    agosto, com 2 vagas/dia para técnicos). Posição relativa = 8 → vai para a 9ª posição.
+ *
+ * Quando o afastamento é tão longo que nenhuma data hipotética gerada satisfaz a condição
+ * de retorno (nenhum dia útil intermediário entre fim+1 e a data hipotética), o pendente
+ * NÃO é movido — sua posição "natural" já reflete que ele não voltará tão cedo.
+ *
+ * Em caso de empate de `posInsercaoHipotetica` entre múltiplos pendentes, quem termina o
+ * afastamento mais cedo fica antes (FIFO por `dataFim`).
+ */
+function aplicarRetornosFeriasPendentesPosEscala({
+  ordemAtual,
+  idxOrdem,
+  afastamentosFlat,
+  datasPlantaoIso,
+  datasNaoUteisIsoSet = new Set(),
+  vagasPorData = 1,
+}) {
+  const ordemSaida = [...(ordemAtual || [])];
+  let idxSaida = Number(idxOrdem) || 0;
+  if (!ordemSaida.length || !Array.isArray(datasPlantaoIso) || datasPlantaoIso.length === 0) {
+    return { ordemAtual: ordemSaida, idxOrdem: idxSaida };
+  }
+  const datasOrdenadas = [...datasPlantaoIso].sort();
+  const vagasEfetivas = Math.max(1, Number(vagasPorData) || 1);
+  const numHipoteticas = Math.max(8, datasOrdenadas.length);
+  const datasHipoteticas = gerarDatasPlantaoHipoteticas(datasOrdenadas, numHipoteticas);
+  const conjuntoMembros = new Set(ordemSaida.map((id) => Number(id)));
+  const pendentes = [];
+  for (const af of afastamentosFlat || []) {
+    const ehFerias = afastamentoEhFerias(af);
+    const ehAbono = afastamentoEhAbono(af);
+    if (!ehFerias && !ehAbono) continue;
+    const usuarioId = Number(af.usuarioId);
+    if (!Number.isFinite(usuarioId) || !conjuntoMembros.has(usuarioId)) continue;
+    const fimIso = dataReferenciaParaStr(af.dataFim);
+    if (!fimIso) continue;
+    const primeiroDiaPosFim = adicionarDiasIso(fimIso, 1);
+    const teveRetornoNaEscala = datasOrdenadas.some(
+      (ds) => ds > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, ds, datasNaoUteisIsoSet),
+    );
+    if (teveRetornoNaEscala) continue;
+    const idxRetornoHipotetico = datasHipoteticas.findIndex(
+      (d) => d > fimIso && existeDiaUtilNoIntervalo(primeiroDiaPosFim, d, datasNaoUteisIsoSet),
+    );
+    if (idxRetornoHipotetico < 0) continue;
+    const apenasEsse = montarAfastamentosPorUsuario([af]);
+    const bloqueiaAlgumPlantao = datasOrdenadas.some((ds) =>
+      usuarioIndisponivelParaPlantaoNoDia(apenasEsse, usuarioId, ds, datasNaoUteisIsoSet),
+    );
+    if (!bloqueiaAlgumPlantao) continue;
+    pendentes.push({
+      usuarioId,
+      fimIso,
+      ehFerias,
+      posInsercaoHipotetica: idxRetornoHipotetico * vagasEfetivas,
+    });
+  }
+  if (pendentes.length === 0) return { ordemAtual: ordemSaida, idxOrdem: idxSaida };
+
+  pendentes.sort((a, b) => {
+    const cmpPos = b.posInsercaoHipotetica - a.posInsercaoHipotetica;
+    if (cmpPos !== 0) return cmpPos;
+    const cmpFim = b.fimIso.localeCompare(a.fimIso);
+    if (cmpFim !== 0) return cmpFim;
+    if (a.ehFerias !== b.ehFerias) return a.ehFerias ? 1 : -1;
+    return Number(a.usuarioId) - Number(b.usuarioId);
+  });
+  const jaProcessados = new Set();
+  let ordemAtualizada = ordemSaida;
+  const idxAtualizado = idxSaida;
+  for (const p of pendentes) {
+    if (jaProcessados.has(p.usuarioId)) continue;
+    if (!ordemAtualizada.includes(p.usuarioId)) continue;
+    const len = ordemAtualizada.length;
+    if (len === 0) break;
+    const posDesejada = ((idxAtualizado + p.posInsercaoHipotetica) % len + len) % len;
+    const lista = [...ordemAtualizada];
+    const idxAtualPendente = lista.indexOf(Number(p.usuarioId));
+    if (idxAtualPendente < 0) continue;
+    lista.splice(idxAtualPendente, 1);
+    const idxIns = Math.min(Math.max(0, posDesejada), lista.length);
+    lista.splice(idxIns, 0, Number(p.usuarioId));
+    ordemAtualizada = lista;
+    jaProcessados.add(p.usuarioId);
+  }
+  return { ordemAtual: ordemAtualizada, idxOrdem: idxAtualizado };
+}
+
 /** Primeira data de plantão após o fim do afastamento em que já houve dia útil (retorno no ciclo). */
 function dataPlantaoRetornoUsuarioNoMapa(retornosFeriasNoPrimeiroPlantao, usuarioId) {
   if (!retornosFeriasNoPrimeiroPlantao) return null;
@@ -1119,6 +1268,41 @@ async function cancelarPermutasPendentesEscala(escalaId, transaction) {
     },
   );
   return permutasCanceladas;
+}
+
+/**
+ * Propaga a ordem final de uma escala (`ordemFinalEscala`) para a `OrdemServidorModel` global
+ * (escopo vet ou téc) preservando os usuários do banco que NÃO pertencem à escala. Apenas as
+ * posições ocupadas pelos membros da escala são reescritas, na ordem em que aparecem em
+ * `ordemFinalEscala`. Evita que recálculos da escala "sumam" com outros servidores cadastrados.
+ *
+ * Equivalente ao fluxo antigo (linha de `ordemGlobalTec/Vet` em `recalcularEscalaInterno`),
+ * porém isolado para o caminho determinístico (`recalcularEscalaCompleta`).
+ */
+async function propagarOrdemEscalaParaOrdemGlobal(ordemFinalEscala, escopo, transaction) {
+  const idsEscala = (ordemFinalEscala || [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+  if (idsEscala.length === 0) return false;
+
+  const ordemGlobalAtual = await obterOrdemGlobalUsuarioIds(transaction, escopo);
+  if (ordemGlobalAtual.length === 0) return false;
+
+  const setEscala = new Set(idsEscala);
+  const posicoesEscalaNaGlobal = [];
+  for (let i = 0; i < ordemGlobalAtual.length; i++) {
+    if (setEscala.has(Number(ordemGlobalAtual[i]))) posicoesEscalaNaGlobal.push(i);
+  }
+  if (posicoesEscalaNaGlobal.length !== idsEscala.length) return false;
+
+  const novaOrdem = [...ordemGlobalAtual];
+  for (let i = 0; i < posicoesEscalaNaGlobal.length; i++) {
+    novaOrdem[posicoesEscalaNaGlobal[i]] = idsEscala[i];
+  }
+  if (novaOrdem.join(',') === ordemGlobalAtual.join(',')) return false;
+
+  await atualizarOrdemServidoresGlobalSemColisao(novaOrdem, transaction, escopo);
+  return true;
 }
 
 async function atualizarOrdemMembrosEscalaSemColisao(escalaId, ordemUsuarioIds, transaction, categoriaMembro = CATEGORIA_MEMBRO.VETERINARIO) {
@@ -3150,6 +3334,16 @@ function simularRodizioVetPlantoes(ordemInicial, datasPlantaoIso, afastamentosFl
     alocacoes.push({ dataIso, usuarioId: usuarioAlocado });
   }
 
+  const ajusteFinal = aplicarRetornosFeriasPendentesPosEscala({
+    ordemAtual,
+    idxOrdem,
+    afastamentosFlat,
+    datasPlantaoIso,
+    datasNaoUteisIsoSet,
+  });
+  ordemAtual = ajusteFinal.ordemAtual;
+  idxOrdem = ajusteFinal.idxOrdem;
+
   const ordemNormalizada = normalizarOrdemRodizioCompleta(ordemAtual, membrosRef);
   const ordemPersistida = rotacionarOrdemParaProximoPreferencial(ordemNormalizada, idxOrdem);
   return { ordemAtual: ordemNormalizada, idxOrdem, ordemPersistida, alocacoes };
@@ -3333,6 +3527,17 @@ function simularRodizioTecPlantoes(
       primeiroUsuarioNoDiaTech.set(dataIso, Number(usuarioAlocado));
     }
   }
+
+  const ajusteFinal = aplicarRetornosFeriasPendentesPosEscala({
+    ordemAtual,
+    idxOrdem,
+    afastamentosFlat,
+    datasPlantaoIso,
+    datasNaoUteisIsoSet,
+    vagasPorData: 2,
+  });
+  ordemAtual = ajusteFinal.ordemAtual;
+  idxOrdem = ajusteFinal.idxOrdem;
 
   const ordemNormalizada = normalizarOrdemRodizioCompleta(ordemAtual, membrosRef);
   const ordemPersistida = rotacionarOrdemParaProximoPreferencial(ordemNormalizada, idxOrdem);
@@ -6572,6 +6777,11 @@ async function recalcularEscalaCompleta(
         transaction,
         CATEGORIA_MEMBRO.VETERINARIO,
       );
+      await propagarOrdemEscalaParaOrdemGlobal(
+        resultado.ordemFinalVet,
+        ESCOPO_ORDEM.VETERINARIO,
+        transaction,
+      );
     }
     if (resultado.ordemMudouTec && ordemMembrosTec.length > 0) {
       await atualizarOrdemMembrosEscalaSemColisao(
@@ -6579,6 +6789,11 @@ async function recalcularEscalaCompleta(
         resultado.ordemFinalTec,
         transaction,
         CATEGORIA_MEMBRO.TECNICO,
+      );
+      await propagarOrdemEscalaParaOrdemGlobal(
+        resultado.ordemFinalTec,
+        ESCOPO_ORDEM.TECNICO,
+        transaction,
       );
     }
   }
@@ -8289,6 +8504,7 @@ EscalaService.__testables = {
   simularRodizioVetPlantoes,
   plantaoVetMesmaPessoaNoFimDeSemanaAnterior,
   simularRodizioTecPlantoes,
+  aplicarRetornosFeriasPendentesPosEscala,
   simularRodizioTecModoFocado,
   corrigirDuplicatasTecnicosMesmoDia,
   textoGestaoDataAdicionalPlantao,

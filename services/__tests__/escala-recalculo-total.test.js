@@ -20,6 +20,7 @@ const EscalaService = require('../escala.service');
 const {
   recalcularEscalaCompletaNucleo,
   simularRodizioVetPlantoes,
+  simularRodizioTecPlantoes,
   classificarRelevanciaAfastamentoEscalaAtiva,
   montarParametrosFiltroAfastamentoPlantoes,
 } = EscalaService.__testables;
@@ -582,6 +583,176 @@ describe('recalcularEscalaCompletaNucleo (Fase 1 — núcleo puro)', () => {
       paramsFiltro,
     };
     expect(classificarRelevanciaAfastamentoEscalaAtiva(afHugo, ctx)).toBe('irrelevante');
+  });
+
+  test('retorno pós-escala: férias téc Fabrícia 20–29/07 com retorno hipotético em 01/08 (fora da escala) coloca-a no início da fila', () => {
+    /**
+     * Cenário real (22 técnicos, ordem oficial):
+     * - Escala junho/julho vai até 26/07/2026 (último plantão).
+     * - Fabrícia (idx 3) tira férias 20–29/07. Como o primeiro plantão pós-fim com dia útil
+     *   intermediário seria 01/08 (sábado), DEPOIS do fim da escala, o "retorno forçado"
+     *   não dispara dentro da simulação.
+     * - Antes desta mudança, o simulador apenas movia Fabrícia para depois da cobertura
+     *   (moverUsuarioDepoisDaCobertura) ao bloqueá-la em 18/07 (retro-cadastro) e 25/07–26/07
+     *   (ativo), empurrando-a para o fundo da fila final (~posição 15).
+     * - Comportamento desejado (espelho do retorno forçado): Fabrícia deve aparecer no
+     *   topo da fila persistida — ela ainda não plantonou nesta escala e seria a próxima
+     *   a plantonear (em 01/08) na escala seguinte. Quem termina o afastamento mais cedo
+     *   tem prioridade sobre os demais pendentes.
+     */
+    const TEC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+    const fabriciaId = TEC[3];
+    const datasTec = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const plantoesTec = plantoesTecGravados(datasTec, TEC);
+    const afFabricia = {
+      id: 1,
+      usuarioId: fabriciaId,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-07-20',
+      dataFim: '2026-07-29',
+    };
+
+    const r = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: plantoesTec,
+      afastamentos: [afFabricia],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+
+    /** Premissa: o afastamento foi considerado relevante (efeito real no calendário). */
+    expect(r.afastamentosRodizioIds).toContain(1);
+    const posFabricia = r.ordemFinalTec.indexOf(fabriciaId);
+    expect(posFabricia).toBeGreaterThanOrEqual(0);
+    expect(posFabricia).toBeLessThanOrEqual(1);
+  });
+
+  test('retorno pós-escala: múltiplos técnicos com retorno fora da escala mantêm ordem FIFO por dataFim', () => {
+    /**
+     * Dois técnicos com afastamento cujo retorno cai fora da escala devem aparecer no topo
+     * da fila persistida na ordem em que voltariam: quem termina o afastamento mais cedo
+     * vem primeiro. Garante que o ajuste pós-escala respeita FIFO por dataFim.
+     */
+    const TEC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+    const tecA = TEC[3];
+    const tecB = TEC[5];
+    const datasTec = [
+      '2026-06-06', '2026-06-07', '2026-06-13', '2026-06-14',
+      '2026-06-20', '2026-06-21', '2026-06-27', '2026-06-28',
+      '2026-07-04', '2026-07-05', '2026-07-11', '2026-07-12',
+      '2026-07-18', '2026-07-19', '2026-07-25', '2026-07-26',
+    ];
+    const plantoesTec = plantoesTecGravados(datasTec, TEC);
+    const afA = {
+      id: 1,
+      usuarioId: tecA,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-07-21',
+      dataFim: '2026-07-29',
+    };
+    const afB = {
+      id: 2,
+      usuarioId: tecB,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-07-22',
+      dataFim: '2026-07-30',
+    };
+
+    const r = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: plantoesTec,
+      afastamentos: [afA, afB],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+
+    const posA = r.ordemFinalTec.indexOf(tecA);
+    const posB = r.ordemFinalTec.indexOf(tecB);
+    expect(posA).toBeGreaterThanOrEqual(0);
+    expect(posB).toBeGreaterThanOrEqual(0);
+    expect(posA).toBeLessThan(posB);
+  });
+
+  test('retorno pós-escala: férias téc Helena 24/07–07/08 (retorno em 15/08) é posicionada na 9ª posição da fila', () => {
+    /**
+     * Cenário real (16 técnicos, escala junho/julho até 26/07): férias de Helena (idx 14)
+     * iniciam em 24/07 e terminam em 07/08, ou seja, o afastamento ainda está em curso nas
+     * primeiras datas hipotéticas de plantão após a escala (01/08, 02/08, 08/08, 09/08).
+     * Helena só retorna em 15/08 (sábado seguinte com dia útil intermediário em 10/08).
+     *
+     * Posicionamento esperado: como ela "pula" 4 datas hipotéticas × 2 vagas/dia = 8 vagas
+     * antes de retornar, deve aparecer na posição 9 (índice 8) da fila persistida — ou seja,
+     * exatamente onde plantonia em 15/08 v0. Antes desta correção ela era empurrada para o
+     * fim da fila (idx 15) por `moverUsuarioDepoisDaCobertura`, e a escala de agosto a
+     * realocava em 23/08 em vez de 15/08.
+     */
+    const TEC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    const helenaId = TEC[14];
+    const plantoesTec = plantoesTecGravados(DATAS_JUN_JUL_VET, TEC);
+    const afHelena = {
+      id: 1,
+      usuarioId: helenaId,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-07-24',
+      dataFim: '2026-08-07',
+    };
+
+    const r = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: plantoesTec,
+      afastamentos: [afHelena],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+
+    expect(r.ordemFinalTec.indexOf(helenaId)).toBe(8);
+  });
+
+  test('retorno pós-escala: ordem persistida em julho permite que escala de agosto coloque Helena em 15/08', () => {
+    /**
+     * Garantia de que o posicionamento na fila final (problema 1) corrige automaticamente o
+     * cenário em que, ao criar a escala de agosto, Helena devia ser alocada em 15/08 (1ª
+     * data com dia útil intermediário pós-fim) e não em 23/08. O simulador da escala
+     * seguinte usa `ordemFinalTec` de julho como ordem inicial; com Helena já posicionada
+     * em idx 8, o retorno forçado em 15/08 a coloca em v0 dessa data.
+     */
+    const TEC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    const helenaId = TEC[14];
+    const plantoesTecJul = plantoesTecGravados(DATAS_JUN_JUL_VET, TEC);
+    const afHelena = {
+      id: 1,
+      usuarioId: helenaId,
+      tipo: { tipo: 'Férias' },
+      dataInicio: '2026-07-24',
+      dataFim: '2026-08-07',
+    };
+    const rJul = recalcularEscalaCompletaNucleo({
+      ordemInicialTec: TEC,
+      ordemMembrosTec: TEC,
+      plantoesGravados: plantoesTecJul,
+      afastamentos: [afHelena],
+      periodicidadeEscala: 'fim_de_semana',
+      dataCongelamentoIso: '2026-01-01',
+    });
+
+    const datasAgo = [
+      '2026-08-01', '2026-08-02', '2026-08-08', '2026-08-09',
+      '2026-08-15', '2026-08-16', '2026-08-22', '2026-08-23',
+      '2026-08-29', '2026-08-30',
+    ];
+    const sim = simularRodizioTecPlantoes(rJul.ordemFinalTec, datasAgo, [afHelena], new Set());
+    const aloc15v0 = sim.alocacoes.find((a) => a.dataIso === '2026-08-15' && a.vagaIndice === 0);
+    const aloc23v0 = sim.alocacoes.find((a) => a.dataIso === '2026-08-23' && a.vagaIndice === 0);
+    expect(aloc15v0?.usuarioId).toBe(helenaId);
+    expect(aloc23v0?.usuarioId).not.toBe(helenaId);
   });
 
   test('alinhamento com `simularRodizioVetPlantoes`: mesmo input, mesma alocação', () => {
