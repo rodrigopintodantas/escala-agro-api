@@ -6872,6 +6872,85 @@ async function carregarPermutasAtivasOverlay(escalaId, transaction) {
  *
  * @returns {{ datasPorUsuarioVet: Map<number,string[]>, datasPorUsuarioTec: Map<number,string[]> }}
  */
+/** Texto da tag de permuta no calendário: "Nome A ↔ Nome B". */
+function rotuloPermutaDuasPessoas(permuta) {
+  const nomeSol =
+    permuta.solicitante?.nome?.trim() ||
+    permuta.solicitante?.login?.trim() ||
+    `Servidor ${permuta.solicitanteUsuarioId}`;
+  const nomeDest =
+    permuta.destinatario?.nome?.trim() ||
+    permuta.destinatario?.login?.trim() ||
+    `Servidor ${permuta.destinatarioUsuarioId}`;
+  return `${nomeSol} ↔ ${nomeDest}`;
+}
+
+/**
+ * Marca `temPermuta` e `permutaRotulo` nos plantões que são um dos dois lados de uma permuta ativa
+ * (titular exibido = destinatário na data do ordinal do solicitante, ou solicitante na data do destinatário).
+ */
+async function marcarPlantoesComPermutaAtiva(plantoes, escalaId, transaction) {
+  const lista = plantoes || [];
+  for (const pl of lista) {
+    pl.temPermuta = false;
+    pl.permutaRotulo = null;
+  }
+  const permutasAtivas = await PermutaSolicitacaoModel.findAll({
+    where: { escalaId, status: 'ativa' },
+    attributes: [
+      'id',
+      'categoria',
+      'solicitanteUsuarioId',
+      'destinatarioUsuarioId',
+      'ordinalSolicitante',
+      'ordinalDestinatario',
+    ],
+    include: [
+      { model: UsuarioModel, as: 'solicitante', attributes: ['id', 'nome', 'login'] },
+      { model: UsuarioModel, as: 'destinatario', attributes: ['id', 'nome', 'login'] },
+    ],
+    transaction,
+  });
+  if (!permutasAtivas.length) return lista;
+
+  const base = await calcularBaseOrdinaisEscala(escalaId, transaction);
+  const rotuloPorPlantaoId = new Map();
+
+  for (const row of permutasAtivas) {
+    const p = row.get ? row.get({ plain: true }) : row;
+    const ordA = Number(p.ordinalSolicitante);
+    const ordB = Number(p.ordinalDestinatario);
+    if (ordA < 1 || ordB < 1) continue;
+    const cat = String(p.categoria || CATEGORIA_PLANTAO.VETERINARIO).toLowerCase();
+    const mapa = cat === CATEGORIA_PLANTAO.TECNICO ? base.datasPorUsuarioTec : base.datasPorUsuarioVet;
+    const uidSol = Number(p.solicitanteUsuarioId);
+    const uidDest = Number(p.destinatarioUsuarioId);
+    const dataA = (mapa.get(uidSol) || [])[ordA - 1];
+    const dataB = (mapa.get(uidDest) || [])[ordB - 1];
+    if (!dataA || !dataB) continue;
+
+    const rotulo = rotuloPermutaDuasPessoas(p);
+    for (const pl of lista) {
+      if (categoriaPlantaoDe(pl) !== cat) continue;
+      const ds = dataReferenciaParaStr(pl.dataReferencia);
+      const uid = Number(pl.usuarioId);
+      const pid = Number(pl.id);
+      if ((ds === dataA && uid === uidDest) || (ds === dataB && uid === uidSol)) {
+        rotuloPorPlantaoId.set(pid, rotulo);
+      }
+    }
+  }
+
+  for (const pl of lista) {
+    const rotulo = rotuloPorPlantaoId.get(Number(pl.id));
+    if (rotulo) {
+      pl.temPermuta = true;
+      pl.permutaRotulo = rotulo;
+    }
+  }
+  return lista;
+}
+
 async function calcularBaseOrdinaisEscala(escalaId, transaction) {
   const entrada = await montarEntradaNucleoEscala(escalaId, transaction);
   const resultado = recalcularEscalaCompletaNucleo({
@@ -7549,6 +7628,7 @@ const EscalaService = {
         const dataRef = dataReferenciaParaStr(p.dataReferencia);
         return dataRef >= dataInicioEscala && dataRef <= dataFimEscala;
       });
+    await marcarPlantoesComPermutaAtiva(plain.plantoes, id);
     plain.permutaPendenteComoSolicitantePlantaoIds = [];
     if (solicitanteUsuarioIdParaPermutas != null) {
       const pendentes = await PermutaSolicitacaoModel.findAll({
