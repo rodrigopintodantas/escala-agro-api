@@ -34,6 +34,30 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
         field: 'plantao_destino_id',
       },
+      categoria: {
+        type: DataTypes.STRING(16),
+        allowNull: true,
+      },
+      ordinalSolicitante: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+        field: 'ordinal_solicitante',
+      },
+      ordinalDestinatario: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+        field: 'ordinal_destinatario',
+      },
+      dataOrigemSnapshot: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+        field: 'data_origem_snapshot',
+      },
+      dataDestinoSnapshot: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+        field: 'data_destino_snapshot',
+      },
       status: { type: DataTypes.STRING(24), allowNull: false, defaultValue: 'pendente' },
     },
     { freezeTableName: true, tableName: 'permuta_solicitacao', timestamps: true },

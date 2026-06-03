@@ -216,9 +216,65 @@ const recusarPermuta = async (req, res, next) => {
   }
 };
 
+const criarPermutaAdmin = async (req, res, next) => {
+  try {
+    const usuId = req.auth && req.auth.UsuarioId ? req.auth.UsuarioId : null;
+    if (!usuId) {
+      return res.status(401).json({ message: 'Não autenticado.' });
+    }
+    const {
+      escalaId,
+      categoria,
+      solicitanteUsuarioId,
+      ordinalSolicitante,
+      destinatarioUsuarioId,
+      ordinalDestinatario,
+    } = req.body || {};
+    const criada = await EscalaService.criarPermutaAdministrador(usuId, {
+      escalaId,
+      categoria,
+      solicitanteUsuarioId,
+      ordinalSolicitante,
+      destinatarioUsuarioId,
+      ordinalDestinatario,
+    });
+    res.status(201).json(criada);
+  } catch (err) {
+    next(err);
+  }
+};
+
+const listarPlantoesBasePermuta = async (req, res, next) => {
+  try {
+    const dados = await EscalaService.listarPlantoesBaseParaPermuta(parseInt(req.params.id, 10));
+    res.status(200).json(dados);
+  } catch (err) {
+    next(err);
+  }
+};
+
+const excluirPermutaAdmin = async (req, res, next) => {
+  try {
+    const usuId = req.auth && req.auth.UsuarioId ? req.auth.UsuarioId : null;
+    if (!usuId) {
+      return res.status(401).json({ message: 'Não autenticado.' });
+    }
+    const resultado = await EscalaService.excluirPermutaAdministrador(
+      usuId,
+      parseInt(req.params.permutaId, 10),
+    );
+    res.status(200).json(resultado);
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   listar,
   listarPermutas,
+  criarPermutaAdmin,
+  excluirPermutaAdmin,
+  listarPlantoesBasePermuta,
   listarVeterinarios,
   listarTecnicos,
   listarOrdemServidores,

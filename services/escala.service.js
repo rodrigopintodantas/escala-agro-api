@@ -6494,6 +6494,81 @@ async function restaurarEstadoAntesAfastamento(afastamentoPlain, transaction) {
  *     adicionais (feriados em dia útil) contam como "dia útil" para retornos.
  *  - `dataCongelamentoIso`: datas estritamente anteriores ficam congeladas (não persistir).
  */
+/**
+ * Datas distintas em que cada usuário é titular, ordenadas crescentemente (calendário base).
+ * Cada usuário aparece no máximo uma vez por data (vet: 1 vaga; téc: rodízio impede repetir no dia),
+ * então a lista funciona como "1º, 2º, 3º… plantão da pessoa na escala".
+ */
+function mapaDatasOrdenadasPorUsuario(alocacoes) {
+  const porUsuario = new Map();
+  const ordenadas = [...(alocacoes || [])].sort((a, b) =>
+    String(a.dataIso).localeCompare(String(b.dataIso)),
+  );
+  for (const a of ordenadas) {
+    const uid = Number(a.usuarioId);
+    if (!Number.isFinite(uid) || uid < 1 || !a.dataIso) continue;
+    if (!porUsuario.has(uid)) porUsuario.set(uid, []);
+    const lista = porUsuario.get(uid);
+    if (!lista.includes(a.dataIso)) lista.push(a.dataIso);
+  }
+  return porUsuario;
+}
+
+/**
+ * Overlay de permutas por ordinal aplicado SOBRE o calendário base (rodízio puro), sem alterar a
+ * ordem do ciclo. Cada permuta amarra (usuarioA, ordinalA) ↔ (usuarioB, ordinalB), em que o ordinal
+ * é o N-ésimo plantão (1-based, por data) da pessoa na escala. Para técnicos a permuta é por DIA
+ * (não por vaga): troca-se a pessoa entre as duas datas, independentemente da vaga.
+ *
+ * Os ordinais são resolvidos no estado base ANTES de qualquer troca (estáveis); depois todas as
+ * trocas são aplicadas de uma vez. Invalida quando o ordinal não existe (a pessoa tem menos
+ * plantões que o ordinal pedido — ex.: cobertura por afastamento removeu uma aparição).
+ *
+ * @returns {{ alocacoesVet, alocacoesTec, permutasInvalidadasIds: number[] }}
+ */
+function aplicarOverlayPermutasNasAlocacoes(alocacoesVet, alocacoesTec, permutas) {
+  const vet = (alocacoesVet || []).map((a) => ({ ...a }));
+  const tec = (alocacoesTec || []).map((a) => ({ ...a }));
+  const permutasInvalidadasIds = [];
+  if (!Array.isArray(permutas) || permutas.length === 0) {
+    return { alocacoesVet: vet, alocacoesTec: tec, permutasInvalidadasIds };
+  }
+
+  const datasPorUsuarioVet = mapaDatasOrdenadasPorUsuario(vet);
+  const datasPorUsuarioTec = mapaDatasOrdenadasPorUsuario(tec);
+
+  /** Resolve todos os pares (slot do A, slot do B) no BASE antes de mutar, para ordinais estáveis. */
+  const trocas = [];
+  for (const p of permutas) {
+    const cat = String(p.categoria || '').toLowerCase();
+    const ehTec = cat === CATEGORIA_PLANTAO.TECNICO;
+    const arr = ehTec ? tec : vet;
+    const mapa = ehTec ? datasPorUsuarioTec : datasPorUsuarioVet;
+    const uidA = Number(p.usuarioA);
+    const uidB = Number(p.usuarioB);
+    const dataA = (mapa.get(uidA) || [])[Number(p.ordinalA) - 1];
+    const dataB = (mapa.get(uidB) || [])[Number(p.ordinalB) - 1];
+    if (!dataA || !dataB) {
+      permutasInvalidadasIds.push(Number(p.id));
+      continue;
+    }
+    const slotA = arr.find((a) => a.dataIso === dataA && Number(a.usuarioId) === uidA);
+    const slotB = arr.find((a) => a.dataIso === dataB && Number(a.usuarioId) === uidB);
+    if (!slotA || !slotB) {
+      permutasInvalidadasIds.push(Number(p.id));
+      continue;
+    }
+    trocas.push({ slotA, slotB, uidA, uidB });
+  }
+
+  for (const t of trocas) {
+    t.slotA.usuarioId = t.uidB;
+    t.slotB.usuarioId = t.uidA;
+  }
+
+  return { alocacoesVet: vet, alocacoesTec: tec, permutasInvalidadasIds };
+}
+
 function recalcularEscalaCompletaNucleo({
   ordemInicialVet = [],
   ordemInicialTec = [],
@@ -6503,6 +6578,7 @@ function recalcularEscalaCompletaNucleo({
   afastamentos = [],
   periodicidadeEscala = 'fim_de_semana',
   dataCongelamentoIso = null,
+  permutas = [],
 }) {
   const plantoesVetGravados = plantoesGravados.filter(
     (p) => categoriaPlantaoDe(p) === CATEGORIA_PLANTAO.VETERINARIO,
@@ -6599,12 +6675,21 @@ function recalcularEscalaCompletaNucleo({
       : { ordemAtual: [...ordemInicialTec], idxOrdem: 0, ordemPersistida: [...ordemInicialTec], alocacoes: [] };
 
   /**
+   * Overlay de permutas por ordinal aplicado SOBRE o rodízio puro (não altera a ordem do ciclo,
+   * apenas o titular de cada plantão). Os ordinais são lidos do calendário base recém-simulado.
+   */
+  const overlay = aplicarOverlayPermutasNasAlocacoes(simVet.alocacoes, simTec.alocacoes, permutas);
+  const alocacoesVetFinais = overlay.alocacoesVet;
+  const alocacoesTecFinais = overlay.alocacoesTec;
+  const permutasInvalidadasIds = overlay.permutasInvalidadasIds;
+
+  /**
    * Plantões para persistir: data >= congelamento E usuário simulado difere do gravado.
    * Datas congeladas com divergência ficam apenas registradas em `diffsCongelados*` (não persistir).
    */
   const updatesVet = [];
   const diffsCongeladosVet = [];
-  for (const aloc of simVet.alocacoes) {
+  for (const aloc of alocacoesVetFinais) {
     const pl = plantoesVetGravados.find(
       (p) => dataReferenciaParaStr(p.dataReferencia) === aloc.dataIso,
     );
@@ -6620,7 +6705,7 @@ function recalcularEscalaCompletaNucleo({
 
   const updatesTec = [];
   const diffsCongeladosTec = [];
-  for (const aloc of simTec.alocacoes) {
+  for (const aloc of alocacoesTecFinais) {
     const pl = plantoesTecGravados.find(
       (p) =>
         dataReferenciaParaStr(p.dataReferencia) === aloc.dataIso &&
@@ -6662,8 +6747,11 @@ function recalcularEscalaCompletaNucleo({
     ordemInicialTec,
     ordemFinalVet: ordemMembrosFinalVet,
     ordemFinalTec: ordemMembrosFinalTec,
-    alocacoesVet: simVet.alocacoes,
-    alocacoesTec: simTec.alocacoes,
+    alocacoesVet: alocacoesVetFinais,
+    alocacoesTec: alocacoesTecFinais,
+    alocacoesBaseVet: simVet.alocacoes,
+    alocacoesBaseTec: simTec.alocacoes,
+    permutasInvalidadasIds,
     updatesVet,
     updatesTec,
     diffsCongeladosVet,
@@ -6688,10 +6776,13 @@ function recalcularEscalaCompletaNucleo({
  * Em `dryRun = true`, nada é gravado — útil para testes de paridade e para calcular relevância
  * de afastamentos via diff (executar com e sem o afastamento e comparar).
  */
-async function recalcularEscalaCompleta(
-  escalaId,
-  { transaction, dataCongelamentoIso = null, dryRun = false } = {},
-) {
+/**
+ * Carrega do BD todas as entradas que o núcleo determinístico precisa para uma escala
+ * (ordem inicial, membros, plantões gravados e afastamentos relevantes). Centraliza a leitura
+ * para que o recálculo e o cálculo do calendário base (usado pelas permutas) compartilhem a
+ * mesma fonte de verdade.
+ */
+async function montarEntradaNucleoEscala(escalaId, transaction) {
   const escala = await EscalaModel.findByPk(escalaId, { transaction });
   if (!escala) throw new ApiBaseError('Escala não encontrada.');
 
@@ -6746,6 +6837,233 @@ async function recalcularEscalaCompleta(
     : [];
   const afastamentos = afastamentosRows.map((a) => (a.get ? a.get({ plain: true }) : a));
 
+  return { escala, ordemMembrosVet, ordemMembrosTec, ordemInicialVet, ordemInicialTec, plantoes, afastamentos };
+}
+
+/** Lê as permutas em vigor (status 'ativa') de uma escala, em ordem de criação (id ASC). */
+async function carregarPermutasAtivasOverlay(escalaId, transaction) {
+  const rows = await PermutaSolicitacaoModel.findAll({
+    where: { escalaId, status: 'ativa' },
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  return rows
+    .map((r) => (r.get ? r.get({ plain: true }) : r))
+    .filter(
+      (r) =>
+        Number(r.ordinalSolicitante) > 0 &&
+        Number(r.ordinalDestinatario) > 0 &&
+        Number(r.solicitanteUsuarioId) > 0 &&
+        Number(r.destinatarioUsuarioId) > 0,
+    )
+    .map((r) => ({
+      id: Number(r.id),
+      categoria: String(r.categoria || CATEGORIA_PLANTAO.VETERINARIO).toLowerCase(),
+      usuarioA: Number(r.solicitanteUsuarioId),
+      ordinalA: Number(r.ordinalSolicitante),
+      usuarioB: Number(r.destinatarioUsuarioId),
+      ordinalB: Number(r.ordinalDestinatario),
+    }));
+}
+
+/**
+ * Calendário base (rodízio puro, SEM overlay de permutas) de uma escala, com os ordinais
+ * de cada pessoa por categoria. Base do cadastro/validação de permutas por ordinal.
+ *
+ * @returns {{ datasPorUsuarioVet: Map<number,string[]>, datasPorUsuarioTec: Map<number,string[]> }}
+ */
+async function calcularBaseOrdinaisEscala(escalaId, transaction) {
+  const entrada = await montarEntradaNucleoEscala(escalaId, transaction);
+  const resultado = recalcularEscalaCompletaNucleo({
+    ordemInicialVet: entrada.ordemInicialVet,
+    ordemInicialTec: entrada.ordemInicialTec,
+    ordemMembrosVet: entrada.ordemMembrosVet,
+    ordemMembrosTec: entrada.ordemMembrosTec,
+    plantoesGravados: entrada.plantoes,
+    afastamentos: entrada.afastamentos,
+    periodicidadeEscala: entrada.escala.periodicidade,
+    permutas: [],
+  });
+  return {
+    escala: entrada.escala,
+    ordemMembrosVet: entrada.ordemMembrosVet,
+    ordemMembrosTec: entrada.ordemMembrosTec,
+    datasPorUsuarioVet: mapaDatasOrdenadasPorUsuario(resultado.alocacoesBaseVet),
+    datasPorUsuarioTec: mapaDatasOrdenadasPorUsuario(resultado.alocacoesBaseTec),
+  };
+}
+
+/**
+ * Reaplica as permutas ativas SOBRE os plantões já persistidos (sem alterar a ordem do ciclo).
+ * Usado pelos fluxos que recalculam pelo motor legado `recalcularEscalaInterno` (inclusão/remoção
+ * de datas extras/feriados), garantindo que a troca "siga o nome" também nesses caminhos.
+ * Invalida permutas cujo ordinal não exista mais no calendário base.
+ */
+async function reaplicarOverlayPermutasPersistido(escalaId, transaction) {
+  const permutas = await carregarPermutasAtivasOverlay(escalaId, transaction);
+  if (permutas.length === 0) return { invalidadasIds: [] };
+
+  const base = await calcularBaseOrdinaisEscala(escalaId, transaction);
+  const plantoes = await PlantaoModel.findAll({ where: { escalaId }, transaction });
+
+  const invalidadasIds = [];
+  const trocas = [];
+  for (const p of permutas) {
+    const ehTec = p.categoria === CATEGORIA_PLANTAO.TECNICO;
+    const mapa = ehTec ? base.datasPorUsuarioTec : base.datasPorUsuarioVet;
+    const dataA = (mapa.get(p.usuarioA) || [])[p.ordinalA - 1];
+    const dataB = (mapa.get(p.usuarioB) || [])[p.ordinalB - 1];
+    if (!dataA || !dataB) {
+      invalidadasIds.push(p.id);
+      continue;
+    }
+    const plA = plantoes.find(
+      (x) => categoriaPlantaoDe(x) === p.categoria && dataReferenciaParaStr(x.dataReferencia) === dataA && Number(x.usuarioId) === p.usuarioA,
+    );
+    const plB = plantoes.find(
+      (x) => categoriaPlantaoDe(x) === p.categoria && dataReferenciaParaStr(x.dataReferencia) === dataB && Number(x.usuarioId) === p.usuarioB,
+    );
+    if (!plA || !plB) {
+      invalidadasIds.push(p.id);
+      continue;
+    }
+    trocas.push({ plA, plB, a: p.usuarioA, b: p.usuarioB });
+  }
+
+  for (const t of trocas) {
+    t.plA.usuarioId = t.b;
+    t.plB.usuarioId = t.a;
+    t.plA.observacao = null;
+    t.plB.observacao = null;
+    await t.plA.save({ transaction });
+    await t.plB.save({ transaction });
+  }
+  if (invalidadasIds.length > 0) {
+    await PermutaSolicitacaoModel.update(
+      { status: 'invalidada' },
+      { where: { id: { [Op.in]: invalidadasIds } }, transaction },
+    );
+  }
+  return { invalidadasIds };
+}
+
+/** Localiza, num mapa (usuário → datas base ordenadas), quem tem a data e qual o ordinal (1-based). */
+function resolverOrdinalPorDataNoMapa(mapa, dataIso) {
+  for (const [usuarioId, datas] of mapa.entries()) {
+    const idx = datas.indexOf(dataIso);
+    if (idx >= 0) return { usuarioId: Number(usuarioId), ordinal: idx + 1 };
+  }
+  return null;
+}
+
+/** Normaliza e valida a categoria informada para uma permuta. */
+function normalizarCategoriaPermuta(categoria) {
+  const cat = String(categoria || '').toLowerCase();
+  if (cat !== CATEGORIA_PLANTAO.VETERINARIO && cat !== CATEGORIA_PLANTAO.TECNICO) {
+    throw new ApiBaseError('Categoria inválida para permuta (use veterinário ou técnico).');
+  }
+  return cat;
+}
+
+/**
+ * Resolve e valida uma permuta por ordinal contra o calendário base atual da escala:
+ * categoria válida, servidores distintos e membros ativos, ordinais existentes e — regra do usuário —
+ * nenhum dos dois slots (servidor + N-ésimo plantão) pode já participar de outra permuta ativa/pendente.
+ *
+ * @returns {{ escala, categoria, dataA: string, dataB: string }}
+ */
+async function resolverPermutaOrdinal(
+  { escalaId, categoria, usuarioA, ordinalA, usuarioB, ordinalB, permutaIdIgnorar = null },
+  transaction,
+) {
+  const eid = parseInt(escalaId, 10);
+  if (!Number.isFinite(eid) || eid < 1) throw new ApiBaseError('Informe a escala.');
+  const cat = normalizarCategoriaPermuta(categoria);
+  const uidA = Number(usuarioA);
+  const uidB = Number(usuarioB);
+  const ordA = Number(ordinalA);
+  const ordB = Number(ordinalB);
+  if (!Number.isFinite(uidA) || uidA < 1 || !Number.isFinite(uidB) || uidB < 1) {
+    throw new ApiBaseError('Selecione os dois servidores da permuta.');
+  }
+  if (uidA === uidB) throw new ApiBaseError('Selecione dois servidores diferentes para a permuta.');
+  if (!Number.isInteger(ordA) || ordA < 1 || !Number.isInteger(ordB) || ordB < 1) {
+    throw new ApiBaseError('Informe o número do plantão (ordinal) de cada servidor.');
+  }
+
+  const base = await calcularBaseOrdinaisEscala(eid, transaction);
+  const membrosCat = cat === CATEGORIA_PLANTAO.VETERINARIO ? base.ordemMembrosVet : base.ordemMembrosTec;
+  const setMembros = new Set(membrosCat.map((id) => Number(id)));
+  if (!setMembros.has(uidA) || !setMembros.has(uidB)) {
+    throw new ApiBaseError('Ambos os servidores devem ser membros ativos da escala na categoria informada.');
+  }
+
+  const mapa = cat === CATEGORIA_PLANTAO.VETERINARIO ? base.datasPorUsuarioVet : base.datasPorUsuarioTec;
+  const datasA = mapa.get(uidA) || [];
+  const datasB = mapa.get(uidB) || [];
+  const dataA = datasA[ordA - 1];
+  const dataB = datasB[ordB - 1];
+  if (!dataA) {
+    throw new ApiBaseError(`O servidor de origem não possui o ${ordA}º plantão nesta escala.`);
+  }
+  if (!dataB) {
+    throw new ApiBaseError(`O servidor de destino não possui o ${ordB}º plantão nesta escala.`);
+  }
+
+  /** "Uma vaga já permutada não pode fazer parte de outra permuta" (slot = servidor + ordinal). */
+  const outras = await PermutaSolicitacaoModel.findAll({
+    where: {
+      escalaId: eid,
+      status: { [Op.in]: ['ativa', 'pendente'] },
+      ...(permutaIdIgnorar != null ? { id: { [Op.ne]: Number(permutaIdIgnorar) } } : {}),
+    },
+    transaction,
+  });
+  const slotsUsados = new Set();
+  for (const o of outras) {
+    const oc = String(o.categoria || '').toLowerCase();
+    slotsUsados.add(`${oc}#${Number(o.solicitanteUsuarioId)}#${Number(o.ordinalSolicitante)}`);
+    slotsUsados.add(`${oc}#${Number(o.destinatarioUsuarioId)}#${Number(o.ordinalDestinatario)}`);
+  }
+  if (slotsUsados.has(`${cat}#${uidA}#${ordA}`) || slotsUsados.has(`${cat}#${uidB}#${ordB}`)) {
+    throw new ApiBaseError('Um dos plantões selecionados já participa de outra permuta. Escolha outro.');
+  }
+
+  return { escala: base.escala, categoria: cat, dataA, dataB };
+}
+
+/** Revalida (no aceite/ativação) que os slots por ordinal de uma permuta ainda existem e estão livres. */
+async function validarSlotsPermutaOrdinalDisponiveis(row, transaction) {
+  return await resolverPermutaOrdinal(
+    {
+      escalaId: row.escalaId,
+      categoria: row.categoria,
+      usuarioA: row.solicitanteUsuarioId,
+      ordinalA: row.ordinalSolicitante,
+      usuarioB: row.destinatarioUsuarioId,
+      ordinalB: row.ordinalDestinatario,
+      permutaIdIgnorar: row.id,
+    },
+    transaction,
+  );
+}
+
+async function recalcularEscalaCompleta(
+  escalaId,
+  { transaction, dataCongelamentoIso = null, dryRun = false } = {},
+) {
+  const {
+    escala,
+    ordemMembrosVet,
+    ordemMembrosTec,
+    ordemInicialVet,
+    ordemInicialTec,
+    plantoes,
+    afastamentos,
+  } = await montarEntradaNucleoEscala(escalaId, transaction);
+
+  const permutas = await carregarPermutasAtivasOverlay(escalaId, transaction);
+
   const resultado = recalcularEscalaCompletaNucleo({
     ordemInicialVet,
     ordemInicialTec,
@@ -6755,9 +7073,16 @@ async function recalcularEscalaCompleta(
     afastamentos,
     periodicidadeEscala: escala.periodicidade,
     dataCongelamentoIso,
+    permutas,
   });
 
   if (!dryRun) {
+    if (Array.isArray(resultado.permutasInvalidadasIds) && resultado.permutasInvalidadasIds.length > 0) {
+      await PermutaSolicitacaoModel.update(
+        { status: 'invalidada' },
+        { where: { id: { [Op.in]: resultado.permutasInvalidadasIds } }, transaction },
+      );
+    }
     for (const u of resultado.updatesVet) {
       const pl = u.plantao;
       pl.usuarioId = u.usuarioId;
@@ -6810,6 +7135,9 @@ async function recalcularEscalaCompleta(
     ordemFinalTec: resultado.ordemFinalTec,
     alocacoesVet: resultado.alocacoesVet,
     alocacoesTec: resultado.alocacoesTec,
+    alocacoesBaseVet: resultado.alocacoesBaseVet,
+    alocacoesBaseTec: resultado.alocacoesBaseTec,
+    permutasInvalidadasIds: resultado.permutasInvalidadasIds,
     diffsCongeladosVet: resultado.diffsCongeladosVet,
     diffsCongeladosTec: resultado.diffsCongeladosTec,
     congelamentoIso: resultado.congelamentoIso,
@@ -7063,7 +7391,38 @@ const EscalaService = {
       ],
       order: [['createdAt', 'DESC']],
     });
-    return rows.map((r) => r.get({ plain: true }));
+    const lista = rows.map((r) => r.get({ plain: true }));
+
+    /**
+     * Para permutas por ordinal (ativa/pendente) resolve a data ATUAL de cada lado no calendário
+     * base de cada escala, para exibição (a snapshot pode estar defasada após recálculos).
+     */
+    const escalaIds = [
+      ...new Set(
+        lista
+          .filter((p) => ['ativa', 'pendente'].includes(String(p.status || '').toLowerCase()))
+          .map((p) => Number(p.escalaId)),
+      ),
+    ];
+    const baseporEscala = new Map();
+    for (const eid of escalaIds) {
+      try {
+        baseporEscala.set(eid, await calcularBaseOrdinaisEscala(eid));
+      } catch (_e) {
+        baseporEscala.set(eid, null);
+      }
+    }
+    for (const p of lista) {
+      const base = baseporEscala.get(Number(p.escalaId));
+      if (!base || !p.ordinalSolicitante || !p.ordinalDestinatario) continue;
+      const cat = String(p.categoria || CATEGORIA_PLANTAO.VETERINARIO).toLowerCase();
+      const mapa = cat === CATEGORIA_PLANTAO.TECNICO ? base.datasPorUsuarioTec : base.datasPorUsuarioVet;
+      const datasS = mapa.get(Number(p.solicitanteUsuarioId)) || [];
+      const datasD = mapa.get(Number(p.destinatarioUsuarioId)) || [];
+      p.dataOrigemAtual = datasS[Number(p.ordinalSolicitante) - 1] || null;
+      p.dataDestinoAtual = datasD[Number(p.ordinalDestinatario) - 1] || null;
+    }
+    return lista;
   },
 
   cancelarPermutaSolicitacao: async (permutaId, usuarioId) => {
@@ -7086,53 +7445,36 @@ const EscalaService = {
       if (Number(row.destinatarioUsuarioId) !== Number(usuarioId)) {
         throw new ApiBaseError('Apenas o destinatário pode aceitar o pedido.');
       }
-      const oid = row.plantaoOrigemId;
-      const did = row.plantaoDestinoId;
-      if (oid == null || did == null) throw new ApiBaseError('Plantões da solicitação inválidos.');
-
-      const [pOrigem, pDestino] = await Promise.all([
-        PlantaoModel.findByPk(oid, { transaction: t }),
-        PlantaoModel.findByPk(did, { transaction: t }),
-      ]);
-      if (!pOrigem || !pDestino) throw new ApiBaseError('Plantão não encontrado.');
-      if (Number(pOrigem.escalaId) !== Number(row.escalaId) || Number(pDestino.escalaId) !== Number(row.escalaId)) {
-        throw new ApiBaseError('Plantões não pertencem a esta escala.');
-      }
-      if (Number(pOrigem.usuarioId) !== Number(row.solicitanteUsuarioId)) {
-        throw new ApiBaseError('O plantão ofertado não está mais com o solicitante; não é possível concluir a permuta.');
-      }
-      if (Number(pDestino.usuarioId) !== Number(row.destinatarioUsuarioId)) {
-        throw new ApiBaseError('O plantão desejado não está mais com o destinatário; não é possível concluir a permuta.');
-      }
-
-      const uSolicitante = pOrigem.usuarioId;
-      const uDestinatario = pDestino.usuarioId;
-      pOrigem.usuarioId = uDestinatario;
-      pDestino.usuarioId = uSolicitante;
-      pOrigem.observacao = null;
-      pDestino.observacao = null;
-      await pOrigem.save({ transaction: t });
-      await pDestino.save({ transaction: t });
-
-      await PermutaSolicitacaoModel.update(
-        { status: 'cancelada' },
-        {
-          where: {
-            escalaId: row.escalaId,
-            status: 'pendente',
-            id: { [Op.ne]: permutaId },
-            [Op.or]: [
-              { plantaoOrigemId: { [Op.in]: [oid, did] } },
-              { plantaoDestinoId: { [Op.in]: [oid, did] } },
-            ],
-          },
-          transaction: t,
-        },
-      );
-
-      row.status = 'aceita';
+      /** Revalida o par por ordinal sobre o calendário base atual antes de ativar o overlay. */
+      await validarSlotsPermutaOrdinalDisponiveis(row, t);
+      row.status = 'ativa';
+      row.plantaoOrigemId = null;
+      row.plantaoDestinoId = null;
       await row.save({ transaction: t });
+      await recalcularEscalaCompleta(row.escalaId, { transaction: t });
       return row.get({ plain: true });
+    });
+  },
+
+  excluirPermutaAdministrador: async (adminUsuarioId, permutaId) => {
+    const admin = await EscalaService.usuarioEhAdministrador(adminUsuarioId);
+    if (!admin) {
+      throw new ApiBaseError('Apenas administradores podem excluir permutas por este fluxo.');
+    }
+    const id = parseInt(permutaId, 10);
+    if (!Number.isFinite(id)) throw new ApiBaseError('ID inválido.');
+
+    return await sequelizeTransaction(async (t) => {
+      const row = await PermutaSolicitacaoModel.findByPk(id, { transaction: t });
+      if (!row) throw new ApiBaseError('Permuta não encontrada.');
+      const escalaId = Number(row.escalaId);
+      const eraAtiva = String(row.status || '').toLowerCase() === 'ativa';
+      await row.destroy({ transaction: t });
+      /** Sem o overlay desta permuta, o recálculo restaura os titulares do rodízio base. */
+      if (eraAtiva) {
+        await recalcularEscalaCompleta(escalaId, { transaction: t });
+      }
+      return { removido: true, id };
     });
   },
 
@@ -7929,9 +8271,11 @@ const EscalaService = {
 
     const escalaAtiva = String(escala.status || '').toLowerCase() === 'ativa';
     if (escalaAtiva) {
-      return await sequelizeTransaction(async (t) =>
-        criarPlantoesDatasExtrasModoGestao(escala, novas, criadoPorUsuarioId, t),
-      );
+      return await sequelizeTransaction(async (t) => {
+        const resp = await criarPlantoesDatasExtrasModoGestao(escala, novas, criadoPorUsuarioId, t);
+        await reaplicarOverlayPermutasPersistido(escalaId, t);
+        return resp;
+      });
     }
 
     return await sequelizeTransaction(async (t) => {
@@ -8000,6 +8344,7 @@ const EscalaService = {
         },
       });
       const permutasCanceladas = await cancelarPermutasPendentesEscala(escalaId, t);
+      await reaplicarOverlayPermutasPersistido(escalaId, t);
       return {
         adicionados: novas.length,
         atualizados: recalc.atualizados,
@@ -8114,42 +8459,152 @@ const EscalaService = {
     };
   },
 
-  solicitarPermuta: async (escalaId, solicitanteUsuarioId, { plantaoOrigemId, plantaoDestinoId }) => {
-    const oid = parseInt(plantaoOrigemId, 10);
-    const did = parseInt(plantaoDestinoId, 10);
+  /**
+   * Lista, por servidor, os plantões do calendário BASE (rodízio puro, sem permutas) de cada
+   * categoria, já numerados (1º, 2º, 3º…) por data. Base do cadastro de permutas por ordinal:
+   * o admin escolhe servidor + número do plantão, e a troca "segue o nome" mesmo se a data mudar.
+   */
+  listarPlantoesBaseParaPermuta: async (escalaId) => {
+    const eid = parseInt(escalaId, 10);
+    if (!Number.isFinite(eid) || eid < 1) throw new ApiBaseError('Identificador da escala inválido.');
+    const base = await calcularBaseOrdinaisEscala(eid);
+
+    const idsUnicos = [
+      ...new Set([...base.datasPorUsuarioVet.keys(), ...base.datasPorUsuarioTec.keys()].map((x) => Number(x))),
+    ].filter((x) => Number.isFinite(x) && x > 0);
+    const usuarios = idsUnicos.length
+      ? await UsuarioModel.findAll({ where: { id: { [Op.in]: idsUnicos } }, attributes: ['id', 'nome', 'login'] })
+      : [];
+    const mapaNome = new Map(usuarios.map((u) => [Number(u.id), u.get({ plain: true })]));
+
+    const montar = (mapa, categoria) =>
+      [...mapa.entries()]
+        .map(([usuarioId, datas]) => {
+          const u = mapaNome.get(Number(usuarioId));
+          return {
+            usuarioId: Number(usuarioId),
+            nome: u ? u.nome : null,
+            login: u ? u.login : null,
+            categoria,
+            plantoes: datas.map((dataIso, i) => ({ ordinal: i + 1, dataReferencia: dataIso })),
+          };
+        })
+        .filter((s) => s.plantoes.length > 0)
+        .sort((a, b) => compararUsuariosPorNomeAlfabetico(a, b));
+
+    return {
+      escalaId: eid,
+      veterinarios: montar(base.datasPorUsuarioVet, CATEGORIA_PLANTAO.VETERINARIO),
+      tecnicos: montar(base.datasPorUsuarioTec, CATEGORIA_PLANTAO.TECNICO),
+    };
+  },
+
+  /**
+   * Veterinário solicita permuta escolhendo seu plantão (origem) e o de outro vet (destino) no
+   * calendário. As datas são traduzidas para ordinais no calendário BASE; assim o pedido segue o
+   * novo modelo por ordinal e a troca passa a "seguir o nome" após o aceite.
+   */
+  solicitarPermuta: async (escalaId, solicitanteUsuarioId, payload = {}) => {
+    const eid = parseInt(escalaId, 10);
+    if (!Number.isFinite(eid) || eid < 1) throw new ApiBaseError('Informe a escala.');
+    const oid = parseInt(payload.plantaoOrigemId, 10);
+    const did = parseInt(payload.plantaoDestinoId, 10);
     if (!oid || !did || oid === did) {
       throw new ApiBaseError('Informe plantão de origem e de destino válidos e diferentes.');
     }
-    const escala = await EscalaModel.findByPk(escalaId);
-    if (!escala) throw new ApiBaseError('Escala não encontrada.');
+    const categoria = CATEGORIA_PLANTAO.VETERINARIO;
 
-    const [origem, destino] = await Promise.all([
-      PlantaoModel.findOne({ where: { id: oid, escalaId } }),
-      PlantaoModel.findOne({ where: { id: did, escalaId } }),
-    ]);
-    if (!origem || !destino) throw new ApiBaseError('Plantão não encontrado nesta escala.');
-    if (categoriaPlantaoDe(origem) !== CATEGORIA_PLANTAO.VETERINARIO || categoriaPlantaoDe(destino) !== CATEGORIA_PLANTAO.VETERINARIO) {
-      throw new ApiBaseError('Permuta só está disponível entre plantões de veterinário.');
-    }
-    if (origem.usuarioId !== solicitanteUsuarioId) throw new ApiBaseError('O plantão de origem deve ser seu.');
-    if (destino.usuarioId === solicitanteUsuarioId) {
-      throw new ApiBaseError('Escolha o plantão de outro veterinário para solicitar a permuta.');
-    }
+    return await sequelizeTransaction(async (t) => {
+      const [pOrigem, pDestino] = await Promise.all([
+        PlantaoModel.findOne({ where: { id: oid, escalaId: eid }, transaction: t }),
+        PlantaoModel.findOne({ where: { id: did, escalaId: eid }, transaction: t }),
+      ]);
+      if (!pOrigem || !pDestino) throw new ApiBaseError('Plantão não encontrado nesta escala.');
+      if (categoriaPlantaoDe(pOrigem) !== CATEGORIA_PLANTAO.VETERINARIO || categoriaPlantaoDe(pDestino) !== CATEGORIA_PLANTAO.VETERINARIO) {
+        throw new ApiBaseError('A permuta pelo perfil veterinário só vale entre plantões de veterinário.');
+      }
 
-    const existente = await PermutaSolicitacaoModel.findOne({
-      where: { escalaId, plantaoOrigemId: oid, plantaoDestinoId: did, status: 'pendente' },
+      const base = await calcularBaseOrdinaisEscala(eid, t);
+      const dataOrigem = dataReferenciaParaStr(pOrigem.dataReferencia);
+      const dataDestino = dataReferenciaParaStr(pDestino.dataReferencia);
+      const ro = resolverOrdinalPorDataNoMapa(base.datasPorUsuarioVet, dataOrigem);
+      const rd = resolverOrdinalPorDataNoMapa(base.datasPorUsuarioVet, dataDestino);
+      if (!ro) throw new ApiBaseError('Não foi possível identificar o seu plantão no rodízio base.');
+      if (!rd) throw new ApiBaseError('Não foi possível identificar o plantão desejado no rodízio base.');
+      if (ro.usuarioId !== Number(solicitanteUsuarioId)) {
+        throw new ApiBaseError('O plantão de origem deve ser seu (no rodízio base) e ainda não estar permutado.');
+      }
+      if (rd.usuarioId === Number(solicitanteUsuarioId)) {
+        throw new ApiBaseError('Escolha o plantão de outro veterinário para solicitar a permuta.');
+      }
+
+      const { dataA, dataB } = await resolverPermutaOrdinal(
+        {
+          escalaId: eid,
+          categoria,
+          usuarioA: solicitanteUsuarioId,
+          ordinalA: ro.ordinal,
+          usuarioB: rd.usuarioId,
+          ordinalB: rd.ordinal,
+        },
+        t,
+      );
+      const row = await PermutaSolicitacaoModel.create(
+        {
+          escalaId: eid,
+          solicitanteUsuarioId: Number(solicitanteUsuarioId),
+          destinatarioUsuarioId: rd.usuarioId,
+          categoria,
+          ordinalSolicitante: ro.ordinal,
+          ordinalDestinatario: rd.ordinal,
+          dataOrigemSnapshot: dataA,
+          dataDestinoSnapshot: dataB,
+          status: 'pendente',
+        },
+        { transaction: t },
+      );
+      return row.get({ plain: true });
     });
-    if (existente) throw new ApiBaseError('Já existe uma solicitação pendente para esta permuta.');
+  },
 
-    const row = await PermutaSolicitacaoModel.create({
-      escalaId,
-      solicitanteUsuarioId,
-      destinatarioUsuarioId: destino.usuarioId,
-      plantaoOrigemId: oid,
-      plantaoDestinoId: did,
-      status: 'pendente',
+  /**
+   * Admin: cadastra uma permuta por ordinal já em vigor (status 'ativa'). A troca é aplicada como
+   * overlay no recálculo — não há troca física de linha de plantão amarrada a IDs.
+   */
+  criarPermutaAdministrador: async (adminUsuarioId, payload = {}) => {
+    const admin = await EscalaService.usuarioEhAdministrador(adminUsuarioId);
+    if (!admin) {
+      throw new ApiBaseError('Apenas administradores podem cadastrar permutas por este fluxo.');
+    }
+    const eid = parseInt(payload.escalaId, 10);
+    const categoria = normalizarCategoriaPermuta(payload.categoria);
+    const usuarioA = Number(payload.solicitanteUsuarioId);
+    const ordinalA = Number(payload.ordinalSolicitante);
+    const usuarioB = Number(payload.destinatarioUsuarioId);
+    const ordinalB = Number(payload.ordinalDestinatario);
+
+    return await sequelizeTransaction(async (t) => {
+      const { dataA, dataB } = await resolverPermutaOrdinal(
+        { escalaId: eid, categoria, usuarioA, ordinalA, usuarioB, ordinalB },
+        t,
+      );
+      const row = await PermutaSolicitacaoModel.create(
+        {
+          escalaId: eid,
+          solicitanteUsuarioId: usuarioA,
+          destinatarioUsuarioId: usuarioB,
+          categoria,
+          ordinalSolicitante: ordinalA,
+          ordinalDestinatario: ordinalB,
+          dataOrigemSnapshot: dataA,
+          dataDestinoSnapshot: dataB,
+          status: 'ativa',
+        },
+        { transaction: t },
+      );
+      await recalcularEscalaCompleta(eid, { transaction: t });
+      return row.get({ plain: true });
     });
-    return row.get({ plain: true });
   },
 
   removerPlantoesFeriadosFacultativos: async (escalaId, plantaoIdsRaw, criadoPorUsuarioId = null) => {
@@ -8206,6 +8661,7 @@ const EscalaService = {
         },
       });
       const permutasCanceladas = await cancelarPermutasPendentesEscala(escalaId, t);
+      await reaplicarOverlayPermutasPersistido(escalaId, t);
 
       return {
         removidos: plantoes.length,
@@ -8538,6 +8994,8 @@ EscalaService.__testables = {
   enriquecerRelevanciaEscalaAtivaAfastamentos,
   recalcularEscalaCompleta,
   recalcularEscalaCompletaNucleo,
+  mapaDatasOrdenadasPorUsuario,
+  aplicarOverlayPermutasNasAlocacoes,
 };
 
 module.exports = EscalaService;
